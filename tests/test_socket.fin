@@ -1,0 +1,324 @@
+// Linux socketpair and loopback integration regressions; no external harness.
+import { ws_encode, ws_decode, ws_free_bytes, ws_free_decode, ws_recv_frame, ws_recv_message, ws_free_message, ws_send_frame, ws_send_close, ws_client_connect, ws_server_listen, ws_server_accept, ws_server_close, ws_conn_close, ws_client_request, ws_accept_key, WsBytes, WsDecodeResult, WsMsgResult, WsClientResult, WsAcceptResult } from websocket::fin;
+import { http_accept, http_read_request, http_free_read_result, http_header_get, http_close, http_server_port, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
+import { to_chars, from_chars, concat, free_str, equals } from strings::std;
+import { assert_true } from testing::std;
+
+#[llvm_name="socketpair"] @define pair(domain: int, kind: int, protocol: int, fds: &int) <int>;
+#[llvm_name="send"] @define send_bytes(fd: int, p: &char, n: ulong, flags: int) <long>;
+#[llvm_name="recv"] @define recv_bytes(fd: int, p: &char, n: ulong, flags: int) <long>;
+#[llvm_name="close"] @define close_fd(fd: int) <int>;
+#[llvm_name="fork"] @define fork_process() <int>;
+#[llvm_name="waitpid"] @define wait_process(pid: int, status: &int, flags: int) <int>;
+#[llvm_name="_exit"] @define exit_child(code: int) <noret>;
+#[llvm_name="alarm"] @define alarm_sec(n: uint) <uint>;
+#[llvm_name="socket"] @define open_socket(domain: int, kind: int, protocol: int) <int>;
+#[llvm_name="connect"] @define connect_socket(fd: int, addr: &int, size: int) <int>;
+#[llvm_name="inet_addr"] @define parse_address(s: string) <int>;
+#[llvm_name="fcntl"] @define descriptor_flags(fd: int, command: int) <int>;
+
+fun write_all(fd: int, bytes: [char], count: int) <noret> {
+    let sent <int> = 0;
+    while (sent < count) {
+        let n <long> = send_bytes(fd, &bytes[sent], cast<ulong>(count - sent), 16384);
+        assert_true(n > 0, "raw send succeeds");
+        sent = sent + cast<int>(n);
+    }
+}
+
+fun new_pair() <[int]> {
+    let fds <[int]> = new [int, 2]{};
+    assert_true(pair(1, 1, 0, &fds[0]) == 0, "socketpair");
+    return fds;
+}
+
+fun wait_ok(pid: int) <noret> {
+    let status <int> = -1;
+    assert_true(wait_process(pid, &status, 0) == pid && status == 0, "child succeeded");
+}
+
+fun drain(fd: int) <noret> {
+    let b <[char]> = new [char, 1024]{};
+    while (recv_bytes(fd, &b[0], cast<ulong>(1024), 0) > 0) {}
+    delete b;
+}
+
+fun expect_error(wire: [char], size: int, from_client: bool, code: int) <noret> {
+    let fds <[int]> = new_pair();
+    write_all(fds[1], wire, size);
+    // Sender deliberately remains open: a body read instead of immediate
+    // header rejection hangs and the suite alarm fails the test.
+    let msg <WsMsgResult> = ws_recv_message(fds[0], from_client);
+    assert_true(!msg.ok && msg.closed && msg.error_code == code, "recoverable expected protocol error");
+    ws_free_message(&msg);
+    let reply <WsDecodeResult> = ws_recv_frame(fds[1]);
+    assert_true(reply.ok && reply.opcode == 8 && reply.masked == !from_client, "role-correct error close");
+    let c0 <int> = cast<int>(reply.payload[0]);
+    let c1 <int> = cast<int>(reply.payload[1]);
+    if (c0 < 0) { c0 = c0 + 256; }
+    if (c1 < 0) { c1 = c1 + 256; }
+    assert_true(c0 * 256 + c1 == code, "wire close code");
+    ws_free_decode(&reply);
+    close_fd(fds[0]); close_fd(fds[1]); delete fds;
+}
+
+fun malformed_headers() <noret> {
+    let h <[char]> = new [char, 14]{};
+    // Controls oversized or fragmented, RSV, reserved opcode: no body read.
+    h[0] = cast<char>(137); h[1] = cast<char>(126);
+    expect_error(h, 2, false, 1002);
+    h[0] = cast<char>(9); h[1] = cast<char>(125);
+    expect_error(h, 2, false, 1002);
+    h[0] = cast<char>(193); h[1] = cast<char>(125);
+    expect_error(h, 2, false, 1002);
+    h[0] = cast<char>(131);
+    expect_error(h, 2, false, 1002);
+    // Both masking directions, including control frames and missing mask key.
+    h[0] = cast<char>(137); h[1] = cast<char>(0);
+    expect_error(h, 2, true, 1002);
+    h[0] = cast<char>(138); expect_error(h, 2, true, 1002);
+    h[0] = cast<char>(136); expect_error(h, 2, true, 1002);
+    h[0] = cast<char>(129); expect_error(h, 2, true, 1002);
+    h[1] = cast<char>(253); expect_error(h, 2, false, 1002);
+    h[0] = cast<char>(137); expect_error(h, 2, false, 1002);
+    // Minimal length encodings and high bit / frame cap.
+    h[0] = cast<char>(130); h[1] = cast<char>(126); h[2] = cast<char>(0); h[3] = cast<char>(125);
+    expect_error(h, 4, false, 1002);
+    h[1] = cast<char>(127); h[3] = cast<char>(0); h[8] = cast<char>(255); h[9] = cast<char>(255);
+    expect_error(h, 10, false, 1002);
+    h[2] = cast<char>(128); expect_error(h, 10, false, 1002);
+    h[2] = cast<char>(0); h[6] = cast<char>(1); h[8] = cast<char>(0); h[9] = cast<char>(1);
+    expect_error(h, 10, false, 1009);
+    // Stray continuation rejects before reading advertised payload.
+    h[0] = cast<char>(128); h[1] = cast<char>(125);
+    expect_error(h, 2, false, 1002);
+    delete h;
+}
+
+fun malformed_payloads() <noret> {
+    let body <[char]> = new [char, 130]{};
+    let key <[char]> = new [char, 4]{};
+    for (let i <int> = 0; i < 7; i++) {
+        let count <int> = 2;
+        let code <int> = 1002;
+        if (i == 0) { count = 1; }
+        if (i == 1) { body[0] = cast<char>(3); body[1] = cast<char>(231); } //999
+        if (i == 2) { body[0] = cast<char>(3); body[1] = cast<char>(237); } //1005
+        if (i == 3) { body[0] = cast<char>(3); body[1] = cast<char>(238); } //1006
+        if (i == 4) { body[0] = cast<char>(3); body[1] = cast<char>(247); } //1015
+        if (i == 5) { body[0] = cast<char>(7); body[1] = cast<char>(208); } //2000 reserved
+        if (i == 6) { body[0] = cast<char>(3); body[1] = cast<char>(232); body[2] = cast<char>(255); count = 3; code = 1007; }
+        let wire <WsBytes> = ws_encode(true, 8, body, count, key, 4);
+        expect_error(wire.data, wire.len, true, code);
+        ws_free_bytes(&wire);
+    }
+    body[0] = cast<char>(192); body[1] = cast<char>(128); // overlong
+    let wire <WsBytes> = ws_encode(true, 1, body, 2, key, 0);
+    expect_error(wire.data, wire.len, false, 1007); ws_free_bytes(&wire);
+    body[0] = cast<char>(237); body[1] = cast<char>(160); body[2] = cast<char>(128); // surrogate
+    wire = ws_encode(true, 1, body, 3, key, 0);
+    expect_error(wire.data, wire.len, false, 1007); ws_free_bytes(&wire);
+    body[0] = cast<char>(244); body[1] = cast<char>(144); body[2] = cast<char>(128); body[3] = cast<char>(128);
+    wire = ws_encode(true, 1, body, 4, key, 0);
+    expect_error(wire.data, wire.len, false, 1007); ws_free_bytes(&wire);
+    delete body; delete key;
+}
+
+fun controls_and_utf8(from_client: bool) <noret> {
+    let fds <[int]> = new_pair();
+    let bytes <[char]> = [cast<char>(240), cast<char>(159), cast<char>(152), cast<char>(128), cast<char>(0)];
+    let one <[char]> = new [char, 1]{};
+    one[0] = bytes[0];
+    assert_true(ws_send_frame(fds[1], false, 1, one, 1, from_client), "start fragmented UTF-8");
+    assert_true(ws_send_frame(fds[1], true, 9, bytes, 5, from_client), "interleaved binary ping");
+    assert_true(ws_send_frame(fds[1], false, 0, one, 0, from_client), "empty continuation");
+    for (let i <int> = 1; i < 5; i++) {
+        one[0] = bytes[i];
+        assert_true(ws_send_frame(fds[1], i == 4, 0, one, 1, from_client), "UTF-8 continuation");
+    }
+    let msg <WsMsgResult> = ws_recv_message(fds[0], from_client);
+    assert_true(msg.ok && msg.payload_len == 5 && msg.opcode == 1, "UTF-8 across fragments");
+    for (let i <int> = 0; i < 5; i++) { assert_true(msg.payload[i] == bytes[i], "preserve UTF-8 and NUL"); }
+    ws_free_message(&msg);
+    let pong <WsDecodeResult> = ws_recv_frame(fds[1]);
+    assert_true(pong.ok && pong.opcode == 10 && pong.masked == !from_client && pong.payload_len == 5, "auto pong masking");
+    for (let i <int> = 0; i < 5; i++) { assert_true(pong.payload[i] == bytes[i], "pong echoes bytes"); }
+    ws_free_decode(&pong);
+    // Empty close echoes an empty body (not synthesized status 1000).
+    assert_true(ws_send_frame(fds[1], true, 8, bytes, 0, from_client), "empty close");
+    msg = ws_recv_message(fds[0], from_client);
+    assert_true(msg.ok && msg.closed, "close accepted"); ws_free_message(&msg);
+    let close <WsDecodeResult> = ws_recv_frame(fds[1]);
+    assert_true(close.ok && close.masked == !from_client && close.payload_len == 0, "empty close echo masking");
+    ws_free_decode(&close);
+    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete bytes; delete one;
+}
+
+fun close_bytes_and_eof() <noret> {
+    let fds <[int]> = new_pair();
+    let body <[char]> = [cast<char>(3), cast<char>(232), 'a', cast<char>(0), 'b'];
+    assert_true(ws_send_frame(fds[1], true, 8, body, 5, true), "close reason contains NUL");
+    let msg <WsMsgResult> = ws_recv_message(fds[0], true);
+    assert_true(msg.ok && msg.closed, "binary-safe close reason accepted"); ws_free_message(&msg);
+    let reply <WsDecodeResult> = ws_recv_frame(fds[1]);
+    assert_true(reply.ok && reply.payload_len == 5, "close reason not truncated");
+    for (let i <int> = 0; i < 5; i++) { assert_true(reply.payload[i] == body[i], "close reason byte equality"); }
+    ws_free_decode(&reply); close_fd(fds[0]); close_fd(fds[1]); delete fds; delete body;
+    assert_true(!ws_send_close(-1, 1005, "", false), "invalid outbound status returns false");
+    let long_reason <[char]> = new [char, 125]{};
+    for (let i <int> = 0; i < 124; i++) { long_reason[i] = 'a'; }
+    let reason <string> = from_chars(long_reason, 0, 124);
+    assert_true(!ws_send_close(-1, 1000, reason, false), "long outbound reason returns false");
+    free_str(reason); delete long_reason;
+    fds = new_pair();
+    let short_frame <[char]> = [cast<char>(130), cast<char>(5), 'a'];
+    write_all(fds[1], short_frame, 3); close_fd(fds[1]); delete short_frame;
+    msg = ws_recv_message(fds[0], false);
+    assert_true(!msg.ok && msg.closed && msg.error_code == 0, "truncated transport returns error");
+    ws_free_message(&msg); close_fd(fds[0]); delete fds;
+}
+
+fun fragmented_failure() <noret> {
+    let fds <[int]> = new_pair();
+    let b <[char]> = [cast<char>(226), cast<char>(130)];
+    assert_true(ws_send_frame(fds[1], false, 1, b, 2, false), "unfinished UTF-8 start");
+    assert_true(ws_send_frame(fds[1], true, 0, b, 0, false), "unfinished UTF-8 end");
+    let msg <WsMsgResult> = ws_recv_message(fds[0], false);
+    assert_true(!msg.ok && msg.error_code == 1007, "truncated fragmented UTF-8 fails"); ws_free_message(&msg);
+    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete b;
+    fds = new_pair();
+    let sequence <[char]> = [cast<char>(2), cast<char>(0), cast<char>(129), cast<char>(125)];
+    write_all(fds[1], sequence, 4);
+    msg = ws_recv_message(fds[0], false);
+    assert_true(!msg.ok && msg.error_code == 1002, "new data during fragmentation fails before body"); ws_free_message(&msg);
+    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete sequence;
+}
+
+// Concurrent writer prevents test setup from filling the socket send buffer.
+fun receive_stream(wire: [char], size: int, expected: int, error: int) <noret> {
+    let fds <[int]> = new_pair();
+    let pid <int> = fork_process();
+    assert_true(pid >= 0, "fork");
+    if (pid == 0) {
+        close_fd(fds[0]); write_all(fds[1], wire, size); drain(fds[1]); close_fd(fds[1]); exit_child(0);
+    }
+    close_fd(fds[1]);
+    let msg <WsMsgResult> = ws_recv_message(fds[0], false);
+    if (error == 0) { assert_true(msg.ok && msg.payload_len == expected, "fragment reassembly length"); }
+    else { assert_true(!msg.ok && msg.error_code == error, "fragment budget rejection"); }
+    ws_free_message(&msg); close_fd(fds[0]); delete fds; wait_ok(pid);
+}
+
+fun fragment_limits() <noret> {
+    let count <int> = 10000;
+    let wire <[char]> = new [char, count * 5]{};
+    for (let i <int> = 0; i < count; i++) {
+        wire[i * 5] = cast<char>(i == 0 : 2 ? 0);
+        wire[i * 5 + 1] = cast<char>(1);
+        wire[i * 5 + 2] = cast<char>(i % 251);
+        wire[i * 5 + 3] = cast<char>(i == count - 1 : 128 ? 0);
+        wire[i * 5 + 4] = cast<char>(0);
+    }
+    receive_stream(wire, count * 5, count, 0); delete wire;
+    let cap <int> = 16777216;
+    wire = new [char, cap + 12]{};
+    wire[0] = cast<char>(2); wire[1] = cast<char>(127); wire[6] = cast<char>(1);
+    wire[cap + 10] = cast<char>(128); wire[cap + 11] = cast<char>(0);
+    receive_stream(wire, cap + 12, cap, 0);
+    // Budget overflow is known from this continuation header; body absent.
+    wire[cap + 11] = cast<char>(1);
+    receive_stream(wire, cap + 12, 0, 1009);
+    delete wire;
+}
+
+fun dial(port: int) <int> {
+    let fd <int> = open_socket(2, 1, 0);
+    assert_true(fd >= 0, "open loopback socket");
+    let addr <[int]> = new [int, 4]{};
+    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 + cast<long>(port % 256) * 16777216);
+    addr[1] = parse_address("127.0.0.1");
+    assert_true(connect_socket(fd, &addr[0], 16) == 0, "connect loopback");
+    delete addr; return fd;
+}
+
+fun fd_count() <int> {
+    let count <int> = 0;
+    for (let i <int> = 0; i < 1024; i++) { if (descriptor_flags(i, 1) >= 0) { count++; } }
+    return count;
+}
+
+fun accept_cleanup() <noret> {
+    let srv <&HttpServer> = ws_server_listen(0);
+    let port <int> = http_server_port(srv);
+    let before <int> = fd_count();
+    for (let i <int> = 0; i < 20; i++) {
+        let fd <int> = dial(port);
+        let text <string> = i % 2 == 0 : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" ? "bad\r\n\r\n";
+        let b <[char]> = to_chars(text); write_all(fd, b, b.length - 1); delete b;
+        let accepted <WsAcceptResult> = ws_server_accept(srv);
+        assert_true(!accepted.ok, "invalid upgrade rejected");
+        drain(fd); close_fd(fd);
+    }
+    assert_true(fd_count() == before, "failed accepts do not leak descriptors");
+    ws_server_close(srv);
+}
+
+fun server_coalesced() <noret> {
+    let srv <&HttpServer> = ws_server_listen(0);
+    let port <int> = http_server_port(srv);
+    let fd <int> = dial(port);
+    let request <string> = ws_client_request("127.0.0.1", port, "/", "dGhlIHNhbXBsZSBub25jZQ==");
+    let req <[char]> = to_chars(request); free_str(request);
+    let payload <[char]> = to_chars("first"); let key <[char]> = new [char, 4]{};
+    let frame <WsBytes> = ws_encode(true, 1, payload, 5, key, 4);
+    let size <int> = req.length - 1 + frame.len;
+    let wire <[char]> = new [char, size]{};
+    for (let i <int> = 0; i < req.length - 1; i++) { wire[i] = req[i]; }
+    for (let i <int> = 0; i < frame.len; i++) { wire[req.length - 1 + i] = frame.data[i]; }
+    write_all(fd, wire, size);
+    let accepted <WsAcceptResult> = ws_server_accept(srv);
+    assert_true(accepted.ok, "server upgrade succeeds");
+    let msg <WsMsgResult> = ws_recv_message(accepted.fd, true);
+    assert_true(msg.ok && msg.payload_len == 5 && msg.payload[0] == 'f', "request coalesced frame preserved");
+    ws_free_message(&msg); close_fd(accepted.fd); close_fd(fd); ws_server_close(srv);
+    delete wire; delete req; delete payload; delete key; ws_free_bytes(&frame);
+}
+
+fun client_coalesced() <noret> {
+    let srv <&HttpServer> = ws_server_listen(0);
+    let port <int> = http_server_port(srv);
+    let pid <int> = fork_process(); assert_true(pid >= 0, "fork loopback client");
+    if (pid == 0) {
+        close_fd(srv.fd);
+        let c <WsClientResult> = ws_client_connect("127.0.0.1", port, "/");
+        assert_true(c.ok, "client upgrade succeeds");
+        let msg <WsMsgResult> = ws_recv_message(c.fd, false);
+        assert_true(msg.ok && msg.payload_len == 5 && msg.payload[0] == 'f', "101 coalesced frame preserved");
+        ws_free_message(&msg); close_fd(c.fd); exit_child(0);
+    }
+    let conn <&HttpConn> = http_accept(srv);
+    let request <HttpReadResult> = http_read_request(conn);
+    assert_true(request.ok, "raw server reads upgrade");
+    let accept <string> = ws_accept_key(http_header_get(request.req.headers, "Sec-WebSocket-Key"));
+    let prefix <string> = concat("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ", accept);
+    let response <string> = concat(prefix, "\r\n\r\n");
+    free_str(prefix); free_str(accept); http_free_read_result(&request);
+    let headers <[char]> = to_chars(response); free_str(response);
+    let body <[char]> = to_chars("first"); let key <[char]> = new [char, 1]{};
+    let frame <WsBytes> = ws_encode(true, 1, body, 5, key, 0);
+    let size <int> = headers.length - 1 + frame.len;
+    let wire <[char]> = new [char, size]{};
+    for (let i <int> = 0; i < headers.length - 1; i++) { wire[i] = headers[i]; }
+    for (let i <int> = 0; i < frame.len; i++) { wire[headers.length - 1 + i] = frame.data[i]; }
+    write_all(conn.fd, wire, size);
+    http_close(conn); ws_server_close(srv); wait_ok(pid);
+    delete wire; delete headers; delete body; delete key; ws_free_bytes(&frame);
+}
+
+fun main() <noret> {
+    alarm_sec(cast<uint>(90));
+    malformed_headers(); malformed_payloads();
+    controls_and_utf8(true); controls_and_utf8(false); close_bytes_and_eof(); fragmented_failure();
+    fragment_limits(); accept_cleanup(); server_coalesced(); client_coalesced();
+    printf("all fin-websocket socket tests passed\n");
+}

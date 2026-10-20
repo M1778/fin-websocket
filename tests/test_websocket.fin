@@ -78,10 +78,30 @@ fun main() <noret> {
     assert_true(!ws_validate_server_response(bad_accept, "dGhlIHNhbXBsZSBub25jZQ=="), "wrong accept key rejected");
     assert_true(!ws_validate_server_response("HTTP/1.1 200 OK\r\n\r\n", "dGhlIHNhbXBsZSBub25jZQ=="), "non-101 rejected");
     assert_true(!ws_validate_server_response("HTTP/1.1 101 Switching Protocols\r\n\r\n", "dGhlIHNhbXBsZSBub25jZQ=="), "missing accept header rejected");
+    let incomplete_fields <string> = "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    assert_true(!ws_validate_server_response(incomplete_fields, "dGhlIHNhbXBsZSBub25jZQ=="), "Upgrade and Connection required");
+    let deceptive <string> = "HTTP/1.1 1010 Wrong\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    assert_true(!ws_validate_server_response(deceptive, "dGhlIHNhbXBsZSBub25jZQ=="), "status is exactly 101");
+    let fake_header <string> = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nX-Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    assert_true(!ws_validate_server_response(fake_header, "dGhlIHNhbXBsZSBub25jZQ=="), "header name boundaries");
+    let duplicate <string> = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Accept: wrong\r\n\r\n";
+    assert_true(!ws_validate_server_response(duplicate, "dGhlIHNhbXBsZSBub25jZQ=="), "duplicate accept rejected");
+    let extension <string> = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+    assert_true(!ws_validate_server_response(extension, "dGhlIHNhbXBsZSBub25jZQ=="), "unsolicited extension rejected");
+    let bad_padding <WsBytes> = ws_b64decode("AA=A");
+    assert_true(bad_padding.len == -1, "padding must be final"); ws_free_bytes(&bad_padding);
+    bad_padding = ws_b64decode("AB==");
+    assert_true(bad_padding.len == -1, "unused pad bits zero"); ws_free_bytes(&bad_padding);
 
     // --- client handshake header check (server side) ---
     assert_true(ws_check_handshake_headers("GET", "websocket", "Upgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "valid handshake headers");
-    assert_true(ws_check_handshake_headers("get", "WebSocket", "keep-alive, Upgrade", "key", "13"), "case-insensitive match");
+    assert_true(ws_check_handshake_headers("GET", "WebSocket", "keep-alive, Upgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "case-insensitive tokens");
+    assert_true(!ws_check_handshake_headers("get", "websocket", "Upgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "method is case-sensitive");
+    assert_true(!ws_check_handshake_headers("GET", "xwebsocket", "Upgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "upgrade token boundaries");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "xupgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "connection token boundaries");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "Upgrade,", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "empty list element");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "Upgrade", "key", "13"), "key must be 16 decoded bytes");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "Upgrade", "dGhlIHNhbXBsZSBub25jZR==", "13"), "key pad bits must be canonical");
     assert_true(!ws_check_handshake_headers("POST", "websocket", "Upgrade", "key", "13"), "non-GET rejected");
     assert_true(!ws_check_handshake_headers("GET", "h2c", "Upgrade", "key", "13"), "wrong upgrade rejected");
     assert_true(!ws_check_handshake_headers("GET", "websocket", "keep-alive", "key", "13"), "missing upgrade token rejected");

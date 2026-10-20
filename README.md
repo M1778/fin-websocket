@@ -32,7 +32,19 @@ Then `import { ... } from websocket::fin;`.
 - [`M1778/fin-crypto@0.1.1`](https://github.com/M1778/fin-crypto) — CSPRNG
   (`random_bytes`) for client keys and frame masks, `const_time_eq` for the
   accept-key comparison.
-- Fin std: `bits`, `strings`, `networking` (raw socket syscalls).
+- Fin std: `bits`, `strings`, `networking` (socket creation/address helpers).
+
+**Unreleased integration requirement:** this working tree must currently be built
+with the coordinated sibling `zhttp/src` snapshot, not the published
+`zhttp@0.1.0` manifest pin. That snapshot preserves bytes following HTTP headers
+and rejects duplicate WebSocket singleton headers. Both libraries now declare
+Linux `send`/`recv` with `ulong` byte counts (`size_t`) and `long` returns
+(`ssize_t`). The old zhttp and frozen std raw `c_send`/`c_recv` declarations use
+incompatible types: do not import those raw symbols into the same executable.
+The manifest is deliberately unchanged; a compatible zhttp release and pin
+update are a **release blocker**, not an existing published version.
+No new detach API is required: after successful handoff we free the existing
+plain `HttpConn` wrapper while preserving the caller-owned descriptor.
 
 ### Why SHA-1 and base64 are vendored here
 
@@ -81,9 +93,29 @@ Opcodes are `int` codes (backend limit: no enum-typed struct fields):
 | `ws_recv_message(fd, from_client) <WsMsgResult>` | Reassemble fragmented messages; auto-replies pong, echoes close |
 | `ws_free_bytes / ws_free_decode / ws_free_message` | Free result buffers (`&` — no address auto-taking) |
 
-`ws_recv_message` with `from_client=true` enforces RFC 6455 §5.1 (client
-frames must be masked): an unmasked data frame gets a 1002 close and an
-error.
+`ws_recv_message` enforces masking on **every** frame: `from_client=true`
+requires masked input and sends unmasked replies; `false` requires unmasked
+input and sends masked replies. Header validation rejects unknown opcodes,
+RSV bits, fragmented/oversized control frames, nonminimal lengths and size
+limits before reading a payload. Text is checked as complete UTF-8 after
+reassembly, so codepoints may span fragments. Close status/reason validation
+is recoverable; empty Close bodies and embedded NULs are echoed unchanged.
+
+`WsDecodeResult.error_code` and `WsMsgResult.error_code` distinguish protocol
+errors (1002), invalid UTF-8 (1007), and size limits (1009); zero means no
+protocol classification, including incomplete input or transport failure.
+On failure, `ws_recv_message` attempts a role-correct Close and shuts down socket
+I/O. The caller **still owns and must close the fd**. The low-level
+`ws_decode`/`ws_recv_frame` APIs are role-neutral and cannot validate whole
+fragment sequences. `ws_encode` remains a deterministic low-level wire builder;
+`ws_send_frame` and convenience senders reject invalid outbound frames with
+`false`.
+
+Handshake validators require exact HTTP fields and token boundaries, uppercase
+`GET`, a canonical Base64 key decoding to 16 bytes, and a valid 101 response
+with Upgrade, Connection and Accept. Unsolicited extensions/subprotocols are
+rejected. Response duplicate required fields are rejected; on the server,
+duplicate singleton rejection relies on the coordinated zhttp snapshot.
 
 ## Examples
 
@@ -92,27 +124,61 @@ error.
 
 ## Verification status
 
-**VERIFIED 2026-10-20** — built and executed with finc 0.4.0 (contract 3).
-`tests/test_websocket.fin` passes: FIPS 180-1 SHA-1 vectors (double-checked
-against Python `hashlib` **and** `openssl`), the RFC 6455 §1.3 accept-key
-vector, the RFC 6455 §5.7 masked-"Hello" frame bytes, 16-bit and 64-bit
-extended-length round-trips (300 and 70000 bytes), close frames, and the pure
-handshake validators. Socket I/O (`ws_client_connect`, `ws_server_accept`,
-`ws_recv_message`) is exercised by `examples/echo_server.fin` +
-`examples/echo_client.fin` against a live loopback peer (two processes).
+**VERIFIED 2026-10-21** — frozen finc 0.4.0 (contract 3), Linux x86-64,
+coordinated sibling zhttp and fin-crypto sources, executable builds at **O0
+and O2**. All commands below exit zero; no Python peer or external test service
+is needed. The socket suite uses Fin libc bindings for socketpair, fork and
+loopback peers, with an alarm turning accidental blocking into a failed run.
+
+From the workspace parent containing `fin-websocket`, `zhttp`, `fin-crypto`
+and `.toolchain`, run this Bash block:
+
+```bash
+set -e
+ROOT="$PWD"
+mkdir -p "$ROOT/fin-websocket/out"
+for opt in 0 2; do
+  for suite in test_websocket test_socket bench_fragments; do
+    "$ROOT/.toolchain/bin/finc" "$ROOT/fin-websocket/tests/$suite.fin" \
+      --fin-libs "$ROOT/.toolchain/lib/std" \
+      -I "$ROOT/fin-websocket/src" -I "$ROOT/zhttp/src" \
+      -I "$ROOT/fin-crypto/src" -O"$opt" \
+      -o "$ROOT/fin-websocket/out/${suite}_O$opt"
+    "$ROOT/fin-websocket/out/${suite}_O$opt"
+  done
+done
+```
+
+- `test_websocket.fin`: SHA-1/Base64/RFC vectors, length roundtrips, strict
+  handshake fields, canonical nonce/padding, and malformed responses.
+- `test_socket.fin`: malformed header-only peers (no body, no EOF), mask
+  directions, recoverable oversized Ping/bad Close, UTF-8 split across frames,
+  interleaved binary Ping/Pong, empty Close, tiny/empty fragments, exact 16 MiB
+  messages and overflow rejected before body reads, failed-accept descriptor
+  counts, and first-frame preservation when coalesced with either handshake.
+- `bench_fragments.fin`: alternating one-byte and empty fragments, payload
+  integrity assertions, three messages per size. Observed 16/32/64 KiB results:
+  **O0 72/152/291 ms; O2 46/90/176 ms**. These are environment-specific timings,
+  not test thresholds; near-doubling illustrates linear growth rather than
+  quadratic prefix copying.
 
 
 ## Known limitations (v0.1.0)
 
-- Blocking TCP, IPv4 dotted quads only (inherits std `networking.fin`'s model;
-  no hostname resolution, no TLS — run behind a TLS terminator).
-- One frame / one reassembled message capped at 16 MB.
-- `ws_server_accept` leaks the small zhttp `HttpConn` wrapper per connection
-  (`http_close` would close the fd being handed to the caller); the fd itself
-  does not leak.
-- No compression (`permessage-deflate`) or extensions.
-- Fragment reassembly copies per fragment (O(n²) for pathological
-  fragmentation); fine for normal use.
+- Linux blocking TCP, IPv4 dotted quads only; no hostname resolution or TLS.
+  Linux-specific MSG_NOSIGNAL avoids process termination on disconnected peers;
+  short I/O and EINTR are retried. No read/write deadlines: an indefinitely
+  slow peer or unending empty/control frames can occupy a blocking caller.
+- One frame / one reassembled message capped at 16 MiB. Geometric accumulator
+  growth makes fragmented reassembly linear in bytes plus frame count; empty
+  fragments do not copy the accumulated prefix.
+- No compression, extensions, or subprotocol negotiation.
+- UTF-8 validity of fragmented text is determined when the message completes.
+- zhttp owns HTTP parsing and accept behavior; its permanent accept errors may
+  still abort. Repeated Upgrade/Connection fields on server requests retain
+  zhttp's last-value semantics rather than combining field lines.
+- Allocation-failure behavior and concurrent readers on one fd are unsupported.
+  Result payloads are caller-owned; free exactly once using the matching API.
 
 ## Changelog
 

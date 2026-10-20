@@ -1,0 +1,69 @@
+// Repeatable Linux fragmentation benchmark. Timings include socket transport,
+// parsing and reassembly. Compare scaling, not an absolute wall-clock gate.
+import { ws_recv_message, ws_free_message, WsMsgResult } from websocket::fin;
+import { assert_true } from testing::std;
+#[llvm_name="socketpair"] @define pair(domain: int, kind: int, protocol: int, fds: &int) <int>;
+#[llvm_name="send"] @define send_bytes(fd: int, p: &char, n: ulong, flags: int) <long>;
+#[llvm_name="close"] @define close_fd(fd: int) <int>;
+#[llvm_name="fork"] @define fork_process() <int>;
+#[llvm_name="waitpid"] @define wait_process(pid: int, status: &int, flags: int) <int>;
+#[llvm_name="_exit"] @define exit_child(code: int) <noret>;
+#[llvm_name="alarm"] @define alarm_sec(n: uint) <uint>;
+#[llvm_name="clock_gettime"] @define clock_ns(kind: int, out: &long) <int>;
+
+fun now_ns() <long> {
+    let ts <[long]> = new [long, 2]{};
+    assert_true(clock_ns(1, &ts[0]) == 0, "monotonic clock");
+    let result <long> = ts[0] * cast<long>(1000000000) + ts[1];
+    delete ts;
+    return result;
+}
+
+fun measure(count: int, repeats: int) <noret> {
+    // Alternate one-byte and empty fragments. A regression copying the
+    // prefix on empty frames doubles an already quadratic workload.
+    let wire <[char]> = new [char, count * 5]{};
+    for (let i <int> = 0; i < count; i++) {
+        wire[i * 5] = cast<char>(i == 0 : 2 ? 0);
+        wire[i * 5 + 1] = cast<char>(1);
+        wire[i * 5 + 2] = cast<char>(i % 251);
+        wire[i * 5 + 3] = cast<char>(i == count - 1 : 128 ? 0);
+        wire[i * 5 + 4] = cast<char>(0);
+    }
+    let fds <[int]> = new [int, 2]{};
+    assert_true(pair(1, 1, 0, &fds[0]) == 0, "socketpair");
+    let start <long> = now_ns();
+    let pid <int> = fork_process();
+    assert_true(pid >= 0, "fork");
+    if (pid == 0) {
+        close_fd(fds[0]);
+        for (let j <int> = 0; j < repeats; j++) {
+            let sent <int> = 0;
+            while (sent < count * 5) {
+                let n <long> = send_bytes(fds[1], &wire[sent], cast<ulong>(count * 5 - sent), 16384);
+                assert_true(n > 0, "send benchmark stream"); sent = sent + cast<int>(n);
+            }
+        }
+        close_fd(fds[1]); exit_child(0);
+    }
+    close_fd(fds[1]);
+    for (let j <int> = 0; j < repeats; j++) {
+        let msg <WsMsgResult> = ws_recv_message(fds[0], false);
+        assert_true(msg.ok && msg.payload_len == count, "benchmark complete message");
+        for (let i <int> = 0; i < count; i++) { assert_true(msg.payload[i] == cast<char>(i % 251), "benchmark payload integrity"); }
+        ws_free_message(&msg);
+    }
+    close_fd(fds[0]);
+    let status <int> = -1;
+    assert_true(wait_process(pid, &status, 0) == pid && status == 0, "benchmark writer succeeded");
+    let elapsed <long> = now_ns() - start;
+    printf("payload=%d fragments=%d repeats=%d elapsed_ms=%lld\n", count, count * 2, repeats, elapsed / cast<long>(1000000));
+    delete fds; delete wire;
+}
+
+fun main() <noret> {
+    alarm_sec(cast<uint>(120));
+    measure(16384, 3);
+    measure(32768, 3);
+    measure(65536, 3);
+}
