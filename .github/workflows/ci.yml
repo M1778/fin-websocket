@@ -56,15 +56,21 @@ jobs:
           echo "/tmp/Fin/build" >> "$GITHUB_PATH"
           /tmp/Fin/build/finc --version
 
+      - name: Fetch Fin dependencies
+        run: |
+          mkdir -p /tmp/fin-deps
+          git clone --depth 1 https://github.com/M1778/zhttp.git /tmp/fin-deps/zhttp
+          git clone --depth 1 https://github.com/M1778/fin-crypto.git /tmp/fin-deps/fin-crypto
+
       - name: Frontend check
         run: |
-          finc src/websocket.fin
+          finc -I /tmp/fin-deps/zhttp/src -I /tmp/fin-deps/fin-crypto/src src/websocket.fin
 
       - name: Build and run tests
         run: |
-          finc tests/test_websocket.fin -I src -o test_websocket && ./test_websocket
+          finc tests/test_websocket.fin -I src -I /tmp/fin-deps/zhttp/src -I /tmp/fin-deps/fin-crypto/src -o test_websocket && ./test_websocket
 
       - name: Compile examples
         run: |
-          finc examples/echo_server.fin -I src -o /tmp/ws_server
-          finc examples/echo_client.fin -I src -o /tmp/ws_client
+          finc examples/echo_server.fin -I src -I /tmp/fin-deps/zhttp/src -I /tmp/fin-deps/fin-crypto/src -o /tmp/ws_server
+          finc examples/echo_client.fin -I src -I /tmp/fin-deps/zhttp/src -I /tmp/fin-deps/fin-crypto/src -o /tmp/ws_client
