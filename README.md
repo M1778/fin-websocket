@@ -29,7 +29,7 @@ Then `import { ... } from websocket::fin;`.
 - [`M1778/zhttp@0.1.0`](https://github.com/M1778/zhttp) — server-side HTTP
   Upgrade handshake parsing (`http_listen` / `http_accept` /
   `http_read_request` / `http_write_raw`). Reused, not reimplemented.
-- [`M1778/fin-crypto@0.1.0`](https://github.com/M1778/fin-crypto) — CSPRNG
+- [`M1778/fin-crypto@0.1.1`](https://github.com/M1778/fin-crypto) — CSPRNG
   (`random_bytes`) for client keys and frame masks, `const_time_eq` for the
   accept-key comparison.
 - Fin std: `bits`, `strings`, `networking` (raw socket syscalls).
@@ -92,14 +92,15 @@ error.
 
 ## Verification status
 
-**UNVERIFIED** — no working `finc` binary was available in the build
-environment, so nothing here has been type-checked or executed yet. The test
-suite (`tests/test_websocket.fin`) covers: FIPS 180-1 SHA-1 vectors
-(double-checked against Python `hashlib` **and** `openssl` — note the 56-char
-vector is `84983e44…70546f1`, not the commonly misquoted `…e4f4971c673b53035e12`),
-the RFC 6455 §1.3 accept-key vector, the RFC 6455 §5.7 masked-"Hello" frame
-bytes, 16-bit and 64-bit extended-length round-trips (300 and 70000 bytes),
-close frames, and the pure handshake validators.
+**VERIFIED 2026-10-20** — built and executed with finc 0.4.0 (contract 3).
+`tests/test_websocket.fin` passes: FIPS 180-1 SHA-1 vectors (double-checked
+against Python `hashlib` **and** `openssl`), the RFC 6455 §1.3 accept-key
+vector, the RFC 6455 §5.7 masked-"Hello" frame bytes, 16-bit and 64-bit
+extended-length round-trips (300 and 70000 bytes), close frames, and the pure
+handshake validators. Socket I/O (`ws_client_connect`, `ws_server_accept`,
+`ws_recv_message`) is exercised by `examples/echo_server.fin` +
+`examples/echo_client.fin` against a live loopback peer (two processes).
+
 
 ## Known limitations (v0.1.0)
 

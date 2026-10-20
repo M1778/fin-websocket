@@ -166,8 +166,11 @@ fun main() <noret> {
     let dc <WsDecodeResult> = ws_decode(cenc.data, cenc.len);
     assert_true(dc.ok && dc.opcode == 8, "close frame opcode");
     assert_true(dc.payload_len == 5, "close payload length");
-    let code <int> = cast<int>(dc.payload[0]) * 256 + cast<int>(dc.payload[1]);
-    // payload[0] is char 3 -> byte value 3 (positive, no sign fix needed)
+    let b0 <int> = cast<int>(dc.payload[0]);
+    if (b0 < 0) { b0 = b0 + 256; }
+    let b1 <int> = cast<int>(dc.payload[1]);
+    if (b1 < 0) { b1 = b1 + 256; }
+    let code <int> = b0 * 256 + b1;
     assert_true(code == 1000, "close code 1000");
     ws_free_decode(&dc);
     ws_free_bytes(&cenc);
