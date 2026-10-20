@@ -1,0 +1,37 @@
+// Echo server example: accepts WebSocket connections on 127.0.0.1:8081 and
+// echoes every text/binary message back. Run this first, then connect with
+// examples/echo_client.fin (or any WebSocket client) in another terminal.
+//
+// Run: finc examples/echo_server.fin -I src -o echo_server && ./echo_server
+
+import { ws_server_listen, ws_server_accept, ws_recv_message, ws_send_frame, ws_free_message, ws_conn_close, WsAcceptResult, WsMsgResult } from websocket::fin;
+import { HttpServer } from zhttp::fin;
+import { from_chars } from strings::std;
+
+fun main() <noret> {
+    let srv <&HttpServer> = ws_server_listen(8081);
+    printf("fin-websocket echo server on 127.0.0.1:8081\n");
+    while (true) {
+        let acc <WsAcceptResult> = ws_server_accept(srv);
+        if (!acc.ok) {
+            printf("accept failed\n");
+            continue;
+        }
+        printf("client connected\n");
+        while (true) {
+            // from_client=true: enforces masked client frames per RFC 6455.
+            let msg <WsMsgResult> = ws_recv_message(acc.fd, true);
+            if (!msg.ok || msg.closed) {
+                ws_free_message(&msg);
+                break;
+            }
+            let text <string> = from_chars(msg.payload, 0, msg.payload_len);
+            printf("echoing: %s\n", text);
+            // Server -> client frames are unmasked.
+            ws_send_frame(acc.fd, true, msg.opcode, msg.payload, msg.payload_len, false);
+            ws_free_message(&msg);
+        }
+        ws_conn_close(acc.fd);
+        printf("client disconnected\n");
+    }
+}

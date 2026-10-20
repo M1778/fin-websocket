@@ -1,0 +1,191 @@
+// fin-websocket test suite.
+//
+// Run: finc tests/test_websocket.fin -I src -o test_websocket && ./test_websocket
+// (from the repo root). Pure-function tests only: SHA-1, base64, the accept
+// key, frame encode/decode, and the handshake validators. Socket I/O is
+// exercised by examples/echo_server.fin + examples/echo_client.fin against a
+// live loopback peer (needs two processes; see README).
+//
+// Vectors: FIPS 180-1 (SHA-1, double-checked against Python hashlib AND
+// openssl — the 56-char vector is 84983e44...70546f1, NOT the commonly
+// misquoted ...e4f4971c673b53035e12), RFC 6455 section 1.3 (accept key) and
+// section 5.7 (masked "Hello" frame).
+
+import { ws_sha1_hex, ws_sha1_bytes_hex, ws_b64encode, ws_b64decode, ws_free_bytes, ws_accept_key, ws_client_key, ws_client_request, ws_validate_server_response, ws_check_handshake_headers, ws_encode, ws_decode, ws_free_decode, WsBytes, WsDecodeResult } from websocket::fin;
+import { assert_true } from testing::std;
+import { equals, len, contains, ends_with } from strings::std;
+import { to_chars, from_chars } from strings::std;
+
+fun bytes_eq(a: [char], b: [char], n: int) <bool> {
+    for (let i <int> = 0; i < n; i++) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+fun main() <noret> {
+    // --- SHA-1, FIPS 180-1 vectors ---
+    assert_true(equals(ws_sha1_hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709"), "sha1('') != FIPS vector");
+    assert_true(equals(ws_sha1_hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d"), "sha1('abc') != FIPS vector");
+    assert_true(equals(ws_sha1_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "84983e441c3bd26ebaae4aa1f95129e5e54670f1"), "sha1(448-bit) != FIPS vector");
+    let abc <[char]> = to_chars("abc");
+    assert_true(equals(ws_sha1_bytes_hex(abc, 3), "a9993e364706816aba3e25717850c26c9cd0d89d"), "sha1_bytes_hex('abc') mismatch");
+    delete abc;
+
+    // --- base64 over byte arrays ---
+    let foobar <[char]> = to_chars("foobar");
+    assert_true(equals(ws_b64encode(foobar, 6), "Zm9vYmFy"), "b64encode('foobar')");
+    delete foobar;
+    let dec <WsBytes> = ws_b64decode("Zm9vYmFy");
+    assert_true(dec.len == 6, "b64decode length");
+    let fb2 <[char]> = to_chars("foobar");
+    assert_true(bytes_eq(dec.data, fb2, 6), "b64decode('Zm9vYmFy')");
+    delete fb2;
+    ws_free_bytes(&dec);
+    // 16 bytes 0..15 -> "AAECAwQFBgcICQoLDA0ODw==" (Python-verified)
+    let seq <[char]> = new [char, 17]{};
+    for (let i <int> = 0; i < 16; i++) { seq[i] = cast<char>(i); }
+    seq[16] = cast<char>(0);
+    assert_true(equals(ws_b64encode(seq, 16), "AAECAwQFBgcICQoLDA0ODw=="), "b64encode(0..15)");
+    delete seq;
+    let bad <WsBytes> = ws_b64decode("!!!");
+    assert_true(bad.len == -1, "b64decode rejects bad input");
+    ws_free_bytes(&bad);
+
+    // --- accept key, RFC 6455 section 1.3 ---
+    assert_true(equals(ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "accept key != RFC 6455 vector");
+
+    // --- client key shape: 16 random bytes -> 24 chars ending "==" ---
+    let ck <string> = ws_client_key();
+    assert_true(len(ck) == 24, "client key length");
+    assert_true(ends_with(ck, "=="), "client key padding");
+
+    // --- handshake request builder ---
+    let req <string> = ws_client_request("127.0.0.1", 8081, "/chat", "dGhlIHNhbXBsZSBub25jZQ==");
+    assert_true(contains(req, "GET /chat HTTP/1.1\r\n"), "request line");
+    assert_true(contains(req, "Host: 127.0.0.1:8081\r\n"), "host header with port");
+    assert_true(contains(req, "Upgrade: websocket\r\n"), "upgrade header");
+    assert_true(contains(req, "Connection: Upgrade\r\n"), "connection header");
+    assert_true(contains(req, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"), "key header");
+    assert_true(contains(req, "Sec-WebSocket-Version: 13\r\n"), "version header");
+    let req80 <string> = ws_client_request("example.com", 80, "/", "abc=");
+    assert_true(contains(req80, "Host: example.com\r\n"), "default port omitted from Host");
+
+    // --- server response validation ---
+    let good_resp <string> = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    assert_true(ws_validate_server_response(good_resp, "dGhlIHNhbXBsZSBub25jZQ=="), "valid 101 response accepted");
+    let bad_accept <string> = "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n";
+    assert_true(!ws_validate_server_response(bad_accept, "dGhlIHNhbXBsZSBub25jZQ=="), "wrong accept key rejected");
+    assert_true(!ws_validate_server_response("HTTP/1.1 200 OK\r\n\r\n", "dGhlIHNhbXBsZSBub25jZQ=="), "non-101 rejected");
+    assert_true(!ws_validate_server_response("HTTP/1.1 101 Switching Protocols\r\n\r\n", "dGhlIHNhbXBsZSBub25jZQ=="), "missing accept header rejected");
+
+    // --- client handshake header check (server side) ---
+    assert_true(ws_check_handshake_headers("GET", "websocket", "Upgrade", "dGhlIHNhbXBsZSBub25jZQ==", "13"), "valid handshake headers");
+    assert_true(ws_check_handshake_headers("get", "WebSocket", "keep-alive, Upgrade", "key", "13"), "case-insensitive match");
+    assert_true(!ws_check_handshake_headers("POST", "websocket", "Upgrade", "key", "13"), "non-GET rejected");
+    assert_true(!ws_check_handshake_headers("GET", "h2c", "Upgrade", "key", "13"), "wrong upgrade rejected");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "keep-alive", "key", "13"), "missing upgrade token rejected");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "Upgrade", "", "13"), "empty key rejected");
+    assert_true(!ws_check_handshake_headers("GET", "websocket", "Upgrade", "key", "12"), "old version rejected");
+
+    // --- frame encode: unmasked "Hello" -> 81 05 48 65 6c 6c 6f ---
+    let hello <[char]> = to_chars("Hello");
+    let empty_key <[char]> = new [char, 1]{};
+    let enc <WsBytes> = ws_encode(true, 1, hello, 5, empty_key, 0);
+    assert_true(enc.len == 7, "unmasked hello frame length");
+    let want_unmasked <[char]> = [cast<char>(129), cast<char>(5), cast<char>(72), cast<char>(101), cast<char>(108), cast<char>(108), cast<char>(111), cast<char>(0)];
+    assert_true(bytes_eq(enc.data, want_unmasked, 7), "unmasked hello frame bytes");
+    delete want_unmasked;
+
+    // --- frame encode: masked "Hello", RFC 6455 section 5.7 ---
+    // key 37 fa 21 3d -> 81 85 37 fa 21 3d 7f 9f 4d 51 58
+    let mkey <[char]> = [cast<char>(55), cast<char>(250), cast<char>(33), cast<char>(61), cast<char>(0)];
+    let menc <WsBytes> = ws_encode(true, 1, hello, 5, mkey, 4);
+    assert_true(menc.len == 11, "masked hello frame length");
+    let want_masked <[char]> = [cast<char>(129), cast<char>(133), cast<char>(55), cast<char>(250), cast<char>(33), cast<char>(61), cast<char>(127), cast<char>(159), cast<char>(77), cast<char>(81), cast<char>(88), cast<char>(0)];
+    assert_true(bytes_eq(menc.data, want_masked, 11), "masked hello frame bytes != RFC 6455 5.7");
+    delete want_masked;
+    delete mkey;
+
+    // --- frame decode: masked hello ---
+    let d1 <WsDecodeResult> = ws_decode(menc.data, menc.len);
+    assert_true(d1.ok, "decode masked hello ok");
+    assert_true(d1.fin, "fin set");
+    assert_true(d1.opcode == 1, "text opcode");
+    assert_true(d1.masked, "masked bit reported");
+    assert_true(d1.payload_len == 5, "payload length");
+    assert_true(d1.consumed == 11, "consumed");
+    assert_true(bytes_eq(d1.payload, hello, 5), "payload unmasked to 'Hello'");
+    ws_free_decode(&d1);
+
+    // --- frame decode: unmasked hello ---
+    let d2 <WsDecodeResult> = ws_decode(enc.data, enc.len);
+    assert_true(d2.ok && d2.fin && d2.opcode == 1 && !d2.masked, "decode unmasked hello");
+    assert_true(d2.consumed == 7 && d2.payload_len == 5, "unmasked lengths");
+    assert_true(bytes_eq(d2.payload, hello, 5), "unmasked payload");
+    ws_free_decode(&d2);
+    ws_free_bytes(&enc);
+    ws_free_bytes(&menc);
+    delete hello;
+    delete empty_key;
+
+    // --- 16-bit extended length round-trip (300 bytes) ---
+    let big <[char]> = new [char, 301]{};
+    for (let i <int> = 0; i < 300; i++) { big[i] = cast<char>(65 + (i % 26)); }
+    big[300] = cast<char>(0);
+    let ekey <[char]> = new [char, 1]{};
+    let ebig <WsBytes> = ws_encode(true, 2, big, 300, ekey, 0);
+    assert_true(ebig.len == 304, "300-byte frame is 4 + 300");
+    assert_true(ebig.data[1] == cast<char>(126), "16-bit length marker");
+    let dbig <WsDecodeResult> = ws_decode(ebig.data, ebig.len);
+    assert_true(dbig.ok && dbig.opcode == 2 && dbig.payload_len == 300, "decode 300-byte frame");
+    assert_true(bytes_eq(dbig.payload, big, 300), "300-byte payload round-trip");
+    ws_free_decode(&dbig);
+    ws_free_bytes(&ebig);
+
+    // --- 64-bit extended length round-trip (70000 bytes) ---
+    let huge <[char]> = new [char, 70001]{};
+    for (let i <int> = 0; i < 70000; i++) { huge[i] = cast<char>(i % 251); }
+    huge[70000] = cast<char>(0);
+    let ehuge <WsBytes> = ws_encode(false, 2, huge, 70000, ekey, 0);
+    assert_true(ehuge.len == 70010, "70000-byte frame is 10 + 70000");
+    assert_true(ehuge.data[1] == cast<char>(127), "64-bit length marker");
+    let dhuge <WsDecodeResult> = ws_decode(ehuge.data, ehuge.len);
+    assert_true(dhuge.ok && !dhuge.fin && dhuge.payload_len == 70000, "decode 70000-byte frame");
+    assert_true(bytes_eq(dhuge.payload, huge, 70000), "70000-byte payload round-trip");
+    ws_free_decode(&dhuge);
+    ws_free_bytes(&ehuge);
+    delete huge;
+    delete big;
+    delete ekey;
+
+    // --- close frame with code 1000 ("bye") ---
+    let cbody <[char]> = [cast<char>(3), cast<char>(232), cast<char>(98), cast<char>(121), cast<char>(101), cast<char>(0)];
+    let ckey <[char]> = new [char, 1]{};
+    let cenc <WsBytes> = ws_encode(true, 8, cbody, 5, ckey, 0);
+    let dc <WsDecodeResult> = ws_decode(cenc.data, cenc.len);
+    assert_true(dc.ok && dc.opcode == 8, "close frame opcode");
+    assert_true(dc.payload_len == 5, "close payload length");
+    let code <int> = cast<int>(dc.payload[0]) * 256 + cast<int>(dc.payload[1]);
+    // payload[0] is char 3 -> byte value 3 (positive, no sign fix needed)
+    assert_true(code == 1000, "close code 1000");
+    ws_free_decode(&dc);
+    ws_free_bytes(&cenc);
+    delete cbody;
+    delete ckey;
+
+    // --- incomplete input is not an error, just "need more" ---
+    let one <[char]> = [cast<char>(129), cast<char>(0)];
+    let di <WsDecodeResult> = ws_decode(one, 1);
+    assert_true(!di.ok && di.consumed == 0, "incomplete header -> need more");
+    ws_free_decode(&di);
+    delete one;
+    // RSV bits set -> hard error
+    let rsv <[char]> = [cast<char>(192), cast<char>(0), cast<char>(0)];
+    let dr <WsDecodeResult> = ws_decode(rsv, 2);
+    assert_true(!dr.ok, "RSV bits rejected");
+    ws_free_decode(&dr);
+    delete rsv;
+
+    printf("all fin-websocket tests passed\n");
+}

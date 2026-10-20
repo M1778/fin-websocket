@@ -1,0 +1,27 @@
+// Echo client example: connects to 127.0.0.1:8081, sends "Hello, Fin!", and
+// prints the reply. Run examples/echo_server.fin first.
+//
+// Run: finc examples/echo_client.fin -I src -o echo_client && ./echo_client
+
+import { ws_client_connect, ws_send_text, ws_recv_message, ws_send_close, ws_free_message, ws_conn_close, WsClientResult, WsMsgResult } from websocket::fin;
+import { from_chars } from strings::std;
+
+fun main() <noret> {
+    let c <WsClientResult> = ws_client_connect("127.0.0.1", 8081, "/chat");
+    if (!c.ok) {
+        printf("connect failed\n");
+        return;
+    }
+    printf("connected\n");
+    // Client -> server frames are masked.
+    ws_send_text(c.fd, "Hello, Fin!", true);
+    let msg <WsMsgResult> = ws_recv_message(c.fd, false);
+    if (msg.ok && !msg.closed) {
+        let text <string> = from_chars(msg.payload, 0, msg.payload_len);
+        printf("server echoed: %s\n", text);
+    }
+    ws_free_message(&msg);
+    ws_send_close(c.fd, 1000, "done", true);
+    ws_conn_close(c.fd);
+    printf("closed\n");
+}

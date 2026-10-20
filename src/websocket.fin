@@ -1,0 +1,1067 @@
+// SPDX-License-Identifier: MIT
+// fin-websocket v0.1.0 — RFC 6455 WebSocket client + server for Fin.
+//
+// Scope: HTTP Upgrade handshake (server side via zhttp, client side over raw
+// TCP), frame encode/decode, client masking, ping/pong, close frames,
+// fragmentation reassembly. Blocking TCP only, IPv4 dotted quads (inherits
+// the std networking.fin address model).
+//
+// Two deliberate vendored pieces (both documented, neither silent):
+//   1. SHA-1: fin-crypto v0.1.0 ships SHA-256 only, and the WebSocket accept
+//      key (RFC 6455 section 4.2.2) requires SHA-1. Implemented below in pure
+//      Fin over bits::std, verified against Python hashlib + openssl. Filed
+//      as a fin-crypto feature request (see README): when fin-crypto ships
+//      sha1, this module switches to it and the vendored copy is deleted.
+//   2. Base64 over byte arrays: std encoding.fin's base64_encode takes a
+//      `string` and measures it with strlen, so it cannot encode binary
+//      digests or random masking keys (embedded NULs truncate). ws_b64encode
+//      takes an explicit length. Proposed as a std addition (see NOTES).
+//
+// STATUS: written against docs/agent-guide.md (Fin v0.4.0). UNVERIFIED — no
+// working finc binary in this environment; nothing below has been
+// type-checked or executed. See README.md "Verification status".
+//
+// Backend limits respected (see Builder #1 NOTES, finc 0.4.0): no `const` in
+// this module (literals + comments), no enum-typed struct fields (opcodes are
+// ints), no Collection<StructType> (parallel collections), no null string
+// returns ("" + ok flags), explicit & on address-taking.
+
+#[stdimport] %{
+import { bit_and, bit_or, bit_xor, bit_not, rotate_left } from bits::std;
+import { to_chars, from_chars, equals, concat, substr, find, trim, to_lower, len, contains, starts_with, parse_int, split_str } from strings::std;
+import { c_socket, c_connect, c_close, c_inet_addr, c_recv } from networking::std;
+import { random_bytes, const_time_eq } from crypto::fin;
+import { http_listen, http_accept, http_read_request, http_write_raw, http_header_get, http_free_read_result, http_server_close, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
+}%
+
+namespace fin {
+
+// --- raw send: std's c_send takes a `string`, which cannot carry binary
+// frame bytes (strlen-truncated). This matches the real C ABI exactly:
+// ssize_t send(int sockfd, const void *buf, size_t len, int flags);
+#[llvm_name="send"]
+@define ws_send(fd: int, buf: &char, len: int, flags: int) <int>;
+
+// --- private helpers ---
+
+// Byte value of b[i] as uint (0..255). char may be signed; adjust like
+// lib/std/encoding.fin does.
+priv fun byte_at(b: [char], i: int) <uint> {
+    let v <int> = cast<int>(b[i]);
+    if (v < 0) { v = v + 256; }
+    return cast<uint>(v);
+}
+
+// Addition modulo 2^32 that never relies on overflow wrapping (same technique
+// as fin-crypto's add32).
+priv fun add32(a: uint, b: uint) <uint> {
+    let a_lo <uint> = a % cast<uint>(65536);
+    let a_hi <uint> = a >> cast<uint>(16);
+    let b_lo <uint> = b % cast<uint>(65536);
+    let b_hi <uint> = b >> cast<uint>(16);
+    let lo_sum <uint> = a_lo + b_lo;
+    let carry <uint> = lo_sum >> cast<uint>(16);
+    let lo <uint> = lo_sum % cast<uint>(65536);
+    let hi <uint> = (a_hi + b_hi + carry) % cast<uint>(65536);
+    return lo + (hi << cast<uint>(16));
+}
+
+priv fun load32_be(b: [char], off: int) <uint> {
+    return byte_at(b, off) * cast<uint>(16777216)
+         + byte_at(b, off + 1) * cast<uint>(65536)
+         + byte_at(b, off + 2) * cast<uint>(256)
+         + byte_at(b, off + 3);
+}
+
+// --- SHA-1 (FIPS 180-1), vendored — see header note ---
+// Only used for the WebSocket accept key. Verified against Python hashlib
+// and openssl: "" -> da39a3ee..., "abc" -> a9993e36..., 56-char FIPS message
+// -> 84983e441c3bd26ebaae4aa1f95129e5e54670f1.
+
+priv fun sha1_compress(h: [uint], block: [char]) <noret> {
+    let w <[uint]> = new [uint, 80]{};
+    for (let i <int> = 0; i < 16; i++) {
+        w[i] = load32_be(block, i * 4);
+    }
+    for (let i <int> = 16; i < 80; i++) {
+        let t <uint> = bit_xor(bit_xor(w[i - 3], w[i - 8]), bit_xor(w[i - 14], w[i - 16]));
+        w[i] = rotate_left(t, cast<uint>(1));
+    }
+    let a <uint> = h[0];
+    let b <uint> = h[1];
+    let c <uint> = h[2];
+    let d <uint> = h[3];
+    let e <uint> = h[4];
+    for (let i <int> = 0; i < 80; i++) {
+        let f <uint> = cast<uint>(0);
+        let k <uint> = cast<uint>(0);
+        if (i < 20) {
+            // f = (b AND c) OR ((NOT b) AND d); k = 0x5A827999
+            f = bit_or(bit_and(b, c), bit_and(bit_not(b), d));
+            k = cast<uint>(1518500249);
+        } else if (i < 40) {
+            // f = b XOR c XOR d; k = 0x6ED9EBA1
+            f = bit_xor(bit_xor(b, c), d);
+            k = cast<uint>(1859775393);
+        } else if (i < 60) {
+            // f = (b AND c) OR (b AND d) OR (c AND d); k = 0x8F1BBCDC
+            f = bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d));
+            k = cast<uint>(2400959708);
+        } else {
+            // f = b XOR c XOR d; k = 0xCA62C1D6
+            f = bit_xor(bit_xor(b, c), d);
+            k = cast<uint>(3395469782);
+        }
+        let temp <uint> = add32(add32(add32(add32(rotate_left(a, cast<uint>(5)), f), e), k), w[i]);
+        e = d;
+        d = c;
+        c = rotate_left(b, cast<uint>(30));
+        b = a;
+        a = temp;
+    }
+    h[0] = add32(h[0], a);
+    h[1] = add32(h[1], b);
+    h[2] = add32(h[2], c);
+    h[3] = add32(h[3], d);
+    h[4] = add32(h[4], e);
+    delete w;
+}
+
+// Raw 20-byte SHA-1 digest of the first len bytes of data. Caller owns it.
+priv fun sha1_raw(data: [char], len: int) <[char]> {
+    let n <int> = len + 9;
+    let rem <int> = n % 64;
+    let padded_len <int> = n;
+    if (rem != 0) { padded_len = n + (64 - rem); }
+    let msg <[char]> = new [char, padded_len]{};
+    for (let i <int> = 0; i < len; i++) { msg[i] = data[i]; }
+    msg[len] = cast<char>(128);
+    for (let i <int> = len + 1; i < padded_len - 8; i++) { msg[i] = cast<char>(0); }
+    let tmp <ulong> = cast<ulong>(len) * cast<ulong>(8);
+    for (let i <int> = 7; i >= 0; i--) {
+        msg[padded_len - 8 + i] = cast<char>(cast<int>(tmp % cast<ulong>(256)));
+        tmp = tmp / cast<ulong>(256);
+    }
+    let h <[uint]> = [cast<uint>(1732584193), cast<uint>(4023233417), cast<uint>(2562383102), cast<uint>(271733878), cast<uint>(3285377520)];
+    let blocks <int> = padded_len / 64;
+    for (let b <int> = 0; b < blocks; b++) {
+        let blk <[char]> = new [char, 64]{};
+        for (let i <int> = 0; i < 64; i++) { blk[i] = msg[b * 64 + i]; }
+        sha1_compress(h, blk);
+        delete blk;
+    }
+    delete msg;
+    let digest <[char]> = new [char, 20]{};
+    for (let i <int> = 0; i < 5; i++) {
+        let v <uint> = h[i];
+        digest[i * 4] = cast<char>(cast<int>(v >> cast<uint>(24)));
+        digest[i * 4 + 1] = cast<char>(cast<int>((v >> cast<uint>(16)) % cast<uint>(256)));
+        digest[i * 4 + 2] = cast<char>(cast<int>((v >> cast<uint>(8)) % cast<uint>(256)));
+        digest[i * 4 + 3] = cast<char>(cast<int>(v % cast<uint>(256)));
+    }
+    delete h;
+    return digest;
+}
+
+priv fun hex_digit(v: uint) <char> {
+    if (v < cast<uint>(10)) {
+        return cast<char>(cast<int>('0') + cast<int>(v));
+    }
+    return cast<char>(cast<int>('a') + cast<int>(v) - 10);
+}
+
+priv fun hex_of_bytes(digest: [char], len: int) <string> {
+    let out <[char]> = new [char, len * 2 + 1]{};
+    for (let i <int> = 0; i < len; i++) {
+        let b <uint> = byte_at(digest, i);
+        out[i * 2] = hex_digit(b >> cast<uint>(4));
+        out[i * 2 + 1] = hex_digit(b % cast<uint>(16));
+    }
+    out[len * 2] = cast<char>(0);
+    let s <string> = from_chars(out, 0, len * 2);
+    delete out;
+    return s;
+}
+
+// --- base64 over byte arrays (vendored — see header note) ---
+
+priv fun b64_char(v: uint) <char> {
+    if (v < cast<uint>(26)) { return cast<char>(cast<int>('A') + cast<int>(v)); }
+    if (v < cast<uint>(52)) { return cast<char>(cast<int>('a') + cast<int>(v) - 26); }
+    if (v < cast<uint>(62)) { return cast<char>(cast<int>('0') + cast<int>(v) - 52); }
+    if (v == cast<uint>(62)) { return '+'; }
+    return '/';
+}
+
+// Standard base64 (with padding) of the first len bytes. The std
+// base64_encode cannot do this: it strlen-measures a `string`, which
+// truncates binary input at the first NUL.
+#[export]
+pub fun ws_b64encode(data: [char], len: int) <string> {
+    blame len >= 0, "ws_b64encode: length must be non-negative";
+    let out_len <int> = ((len + 2) / 3) * 4;
+    let out <[char]> = new [char, out_len + 1]{};
+    let i <int> = 0;
+    let o <int> = 0;
+    while (i + 2 < len) {
+        let v <uint> = byte_at(data, i) * cast<uint>(65536)
+                     + byte_at(data, i + 1) * cast<uint>(256)
+                     + byte_at(data, i + 2);
+        out[o] = b64_char((v >> cast<uint>(18)) % cast<uint>(64));
+        out[o + 1] = b64_char((v >> cast<uint>(12)) % cast<uint>(64));
+        out[o + 2] = b64_char((v >> cast<uint>(6)) % cast<uint>(64));
+        out[o + 3] = b64_char(v % cast<uint>(64));
+        i = i + 3;
+        o = o + 4;
+    }
+    let rem <int> = len - i;
+    if (rem == 1) {
+        let v <uint> = byte_at(data, i) * cast<uint>(65536);
+        out[o] = b64_char((v >> cast<uint>(18)) % cast<uint>(64));
+        out[o + 1] = b64_char((v >> cast<uint>(12)) % cast<uint>(64));
+        out[o + 2] = '=';
+        out[o + 3] = '=';
+    } else if (rem == 2) {
+        let v <uint> = byte_at(data, i) * cast<uint>(65536)
+                     + byte_at(data, i + 1) * cast<uint>(256);
+        out[o] = b64_char((v >> cast<uint>(18)) % cast<uint>(64));
+        out[o + 1] = b64_char((v >> cast<uint>(12)) % cast<uint>(64));
+        out[o + 2] = b64_char((v >> cast<uint>(6)) % cast<uint>(64));
+        out[o + 3] = '=';
+    }
+    out[out_len] = cast<char>(0);
+    let s <string> = from_chars(out, 0, out_len);
+    delete out;
+    return s;
+}
+
+// Byte buffer returned by value; the caller owns `data` and frees it with
+// ws_free_bytes.
+#[export]
+pub struct WsBytes {
+    pub:
+        data <[char]>,
+        len <int>,
+}
+
+#[export]
+pub fun ws_free_bytes(b: &WsBytes) <noret> {
+    delete b.data;
+}
+
+priv fun b64_val(c: char) <int> {
+    if (c >= 'A' && c <= 'Z') { return cast<int>(c) - cast<int>('A'); }
+    if (c >= 'a' && c <= 'z') { return cast<int>(c) - cast<int>('a') + 26; }
+    if (c >= '0' && c <= '9') { return cast<int>(c) - cast<int>('0') + 52; }
+    if (c == '+') { return 62; }
+    if (c == '/') { return 63; }
+    return -1;
+}
+
+// Standard base64 decode. ok=false when the input is malformed.
+#[export]
+pub fun ws_b64decode(s: string) <WsBytes> {
+    let n <int> = len(s);
+    let bad <WsBytes> = WsBytes{data: new [char, 1]{}, len: -1};
+    if (n % 4 != 0) { return bad; }
+    let pad <int> = 0;
+    let chars <[char]> = to_chars(s);
+    if (n >= 1 && chars[n - 1] == '=') { pad = pad + 1; }
+    if (n >= 2 && chars[n - 2] == '=') { pad = pad + 1; }
+    let out_len <int> = (n / 4) * 3 - pad;
+    let out <[char]> = new [char, out_len + 1]{};
+    let o <int> = 0;
+    let ok <bool> = true;
+    for (let i <int> = 0; i < n; i = i + 4) {
+        let v0 <int> = b64_val(chars[i]);
+        let v1 <int> = b64_val(chars[i + 1]);
+        let v2 <int> = b64_val(chars[i + 2]);
+        let v3 <int> = b64_val(chars[i + 3]);
+        if (v0 < 0 || v1 < 0 || (chars[i + 2] != '=' && v2 < 0) || (chars[i + 3] != '=' && v3 < 0)) {
+            ok = false;
+        }
+        if (chars[i + 2] == '=') { v2 = 0; }
+        if (chars[i + 3] == '=') { v3 = 0; }
+        let v <int> = v0 * 262144 + v1 * 4096 + v2 * 64 + v3;
+        if (o < out_len) { out[o] = cast<char>(v / 65536); o = o + 1; }
+        if (o < out_len) { out[o] = cast<char>((v / 256) % 256); o = o + 1; }
+        if (o < out_len) { out[o] = cast<char>(v % 256); o = o + 1; }
+    }
+    delete chars;
+    out[out_len] = cast<char>(0);
+    if (!ok) {
+        delete out;
+        return bad;
+    }
+    return WsBytes{data: out, len: out_len};
+}
+
+// --- SHA-1 public wrappers (vendored — see header) ---
+
+// SHA-1 of a string as lowercase hex (hashes bytes up to the first NUL).
+#[export]
+pub fun ws_sha1_hex(data: string) <string> {
+    let bytes <[char]> = to_chars(data);
+    let n <int> = bytes.length - 1;
+    let digest <[char]> = sha1_raw(bytes, n);
+    let hex <string> = hex_of_bytes(digest, 20);
+    delete bytes;
+    delete digest;
+    return hex;
+}
+
+// SHA-1 of the first len bytes as lowercase hex.
+#[export]
+pub fun ws_sha1_bytes_hex(data: [char], len: int) <string> {
+    blame len >= 0, "ws_sha1_bytes_hex: length must be non-negative";
+    let digest <[char]> = sha1_raw(data, len);
+    let hex <string> = hex_of_bytes(digest, 20);
+    delete digest;
+    return hex;
+}
+
+// --- WebSocket handshake (RFC 6455 section 4) ---
+
+// Sec-WebSocket-Accept for a client key (RFC 6455 section 4.2.2):
+// base64(sha1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).
+// Test vector (RFC 6455 section 1.3): key "dGhlIHNhbXBsZSBub25jZQ==" ->
+// "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=".
+#[export]
+pub fun ws_accept_key(client_key: string) <string> {
+    let magic <string> = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let joined <string> = concat(client_key, magic);
+    let bytes <[char]> = to_chars(joined);
+    let n <int> = bytes.length - 1;
+    let digest <[char]> = sha1_raw(bytes, n);
+    let accept <string> = ws_b64encode(digest, 20);
+    delete bytes;
+    delete digest;
+    return accept;
+}
+
+// A fresh client handshake key: base64 of 16 cryptographically random bytes
+// (fin-crypto's /dev/urandom source). 16 bytes -> 24 chars ending in "==".
+#[export]
+pub fun ws_client_key() <string> {
+    let raw <[char]> = random_bytes(16);
+    let key <string> = ws_b64encode(raw, 16);
+    delete raw;
+    return key;
+}
+
+// The HTTP Upgrade request a client sends. Pure function (no I/O) so tests
+// can inspect it.
+#[export]
+pub fun ws_client_request(host: string, port: int, path: string, key: string) <string> {
+    let req <string> = concat("GET ", path);
+    req = concat(req, " HTTP/1.1\r\nHost: ");
+    req = concat(req, host);
+    // Host header carries the port when it is not the default, so virtual
+    // hosts and reverse proxies route correctly.
+    if (port != 80) {
+        req = concat(req, ":");
+        // int -> string without printf %d: build via repeated append is
+        // overkill here; ports are short, so format manually.
+        let pbuf <[char]> = new [char, 8]{};
+        let tmp <int> = port;
+        let digits <int> = 0;
+        if (tmp == 0) { pbuf[0] = '0'; digits = 1; }
+        while (tmp > 0) {
+            pbuf[digits] = cast<char>(cast<int>('0') + (tmp % 10));
+            tmp = tmp / 10;
+            digits = digits + 1;
+        }
+        for (let i <int> = 0; i < digits; i++) {
+            let one <[char]> = new [char, 2]{};
+            one[0] = pbuf[digits - 1 - i];
+            one[1] = cast<char>(0);
+            let ds <string> = from_chars(one, 0, 1);
+            req = concat(req, ds);
+            delete one;
+        }
+        delete pbuf;
+    }
+    req = concat(req, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+    req = concat(req, key);
+    req = concat(req, "\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    return req;
+}
+
+// Validate a server's 101 response against the key we sent. Pure function.
+// Checks the status line and compares Sec-WebSocket-Accept in constant time.
+#[export]
+pub fun ws_validate_server_response(resp: string, key: string) <bool> {
+    if (!starts_with(resp, "HTTP/1.1 101") && !starts_with(resp, "HTTP/1.0 101")) {
+        return false;
+    }
+    let lower <string> = to_lower(resp);
+    let idx <int> = find(lower, "sec-websocket-accept:");
+    if (idx < 0) { return false; }
+    let val_start <int> = idx + 21;
+    let rest <string> = substr(resp, val_start, len(resp) - val_start);
+    let eol <int> = find(rest, "\r\n");
+    if (eol < 0) { return false; }
+    let got <string> = trim(substr(rest, 0, eol));
+    let want <string> = ws_accept_key(key);
+    return const_time_eq(got, want);
+}
+
+// Validate the extracted client handshake headers (RFC 6455 section 4.2.1).
+// Pure function: the zhttp-based accept path extracts the values, this
+// decides. `upgrade`/`connection` are matched case-insensitively; `key` must
+// be non-empty; `version` must be "13".
+#[export]
+pub fun ws_check_handshake_headers(method: string, upgrade: string, connection: string, key: string, version: string) <bool> {
+    if (!equals(to_lower(trim(method)), "get")) { return false; }
+    if (!contains(to_lower(upgrade), "websocket")) { return false; }
+    if (!contains(to_lower(connection), "upgrade")) { return false; }
+    if (len(trim(key)) == 0) { return false; }
+    if (!equals(trim(version), "13")) { return false; }
+    return true;
+}
+
+// --- client connection ---
+
+#[export]
+pub struct WsClientResult {
+    pub:
+        ok <bool>,
+        fd <int>,
+        err <string>,
+}
+
+// Build a sockaddr_in the way std networking.fin does (family + port/address
+// in network order packed into [int, 4]). `parsed` is c_inet_addr's answer,
+// checked by the caller.
+priv fun ws_sockaddr(parsed: int, port: int) <[int]> {
+    let addr <[int]> = new [int, 4]{};
+    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 + cast<long>(port % 256) * 16777216);
+    addr[1] = parsed;
+    addr[2] = 0;
+    addr[3] = 0;
+    return addr;
+}
+
+// Send exactly len bytes, looping over short sends. False on any error.
+priv fun ws_send_all(fd: int, data: [char], len: int) <bool> {
+    let sent <int> = 0;
+    while (sent < len) {
+        // &data[sent]: address of an element, the same idiom std uses
+        // (&buffer[0]).
+        let n <int> = ws_send(fd, &data[sent], len - sent, 0);
+        if (n <= 0) { return false; }
+        sent = sent + n;
+    }
+    return true;
+}
+
+priv fun ws_send_str_all(fd: int, s: string) <bool> {
+    let bytes <[char]> = to_chars(s);
+    let n <int> = bytes.length - 1;
+    let ok <bool> = ws_send_all(fd, bytes, n);
+    delete bytes;
+    return ok;
+}
+
+// True when buf[0..total] contains the HTTP header terminator \r\n\r\n.
+priv fun has_header_end(buf: [char], total: int) <bool> {
+    if (total < 4) { return false; }
+    for (let i <int> = 0; i <= total - 4; i++) {
+        if (buf[i] == cast<char>(13) && buf[i + 1] == cast<char>(10)
+            && buf[i + 2] == cast<char>(13) && buf[i + 3] == cast<char>(10)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Receive until the HTTP header terminator or `cap` bytes arrive. Returns the
+// bytes read. ok is reported via len == -1 (close/error/overflow).
+priv fun ws_recv_headers(fd: int, cap: int) <WsBytes> {
+    let buf <[char]> = new [char, cap + 1]{};
+    let total <int> = 0;
+    let ok <bool> = true;
+    while (total < cap) {
+        let n <int> = c_recv(fd, &buf[total], cap - total, 0);
+        if (n <= 0) { ok = false; break; }
+        total = total + n;
+        if (has_header_end(buf, total)) { break; }
+    }
+    buf[total] = cast<char>(0);
+    if (total >= cap) { ok = false; }
+    if (!ok) {
+        delete buf;
+        return WsBytes{data: new [char, 1]{}, len: -1};
+    }
+    return WsBytes{data: buf, len: total};
+}
+
+// Open a WebSocket client connection: TCP dial + HTTP Upgrade handshake.
+// Returns the connected fd on success; the caller owns it (ws_conn_close).
+// Hostnames are NOT resolved — dotted quads only, like std networking.fin.
+#[export]
+pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult> {
+    let fail <WsClientResult> = WsClientResult{ok: false, fd: -1, err: ""};
+    if (port <= 0) {
+        fail.err = "ws_client_connect: port is positive";
+        return fail;
+    }
+    // Resolve before opening anything: a bad address is an error, not an
+    // abort (blame would leak the socket).
+    let parsed <int> = c_inet_addr(host);
+    if (parsed == -1) {
+        fail.err = "ws_client_connect: cannot parse the address as a dotted quad";
+        return fail;
+    }
+    let fd <int> = c_socket(2, 1, 0);
+    if (fd < 0) {
+        fail.err = "ws_client_connect: cannot open a socket";
+        return fail;
+    }
+    let addr <[int]> = ws_sockaddr(parsed, port);
+    let err <int> = c_connect(fd, &addr[0], 16);
+    delete addr;
+    if (err != 0) {
+        c_close(fd);
+        fail.err = "ws_client_connect: cannot connect";
+        return fail;
+    }
+    let key <string> = ws_client_key();
+    let req <string> = ws_client_request(host, port, path, key);
+    if (!ws_send_str_all(fd, req)) {
+        c_close(fd);
+        fail.err = "ws_client_connect: cannot send the handshake";
+        return fail;
+    }
+    let resp <WsBytes> = ws_recv_headers(fd, 8192);
+    if (resp.len < 0) {
+        c_close(fd);
+        fail.err = "ws_client_connect: no handshake response";
+        return fail;
+    }
+    let resp_s <string> = from_chars(resp.data, 0, resp.len);
+    delete resp.data;
+    if (!ws_validate_server_response(resp_s, key)) {
+        c_close(fd);
+        fail.err = "ws_client_connect: bad 101 response or accept key";
+        return fail;
+    }
+    return WsClientResult{ok: true, fd: fd, err: ""};
+}
+
+#[export]
+pub fun ws_conn_close(fd: int) <bool> {
+    if (fd < 0) { return false; }
+    return c_close(fd) == 0;
+}
+
+// --- server side (handshake via zhttp) ---
+
+#[export]
+pub struct WsAcceptResult {
+    pub:
+        ok <bool>,
+        fd <int>,
+        err <string>,
+}
+
+// Listen for WebSocket connections. Thin wrapper over zhttp so the HTTP
+// parsing (request line, headers) is reused, not reimplemented.
+#[export]
+pub fun ws_server_listen(port: int) <&HttpServer> {
+    return http_listen(port);
+}
+
+#[export]
+pub fun ws_server_close(srv: &HttpServer) <noret> {
+    http_server_close(srv);
+}
+
+// Accept one connection and run the server side of the opening handshake.
+// On success returns the raw TCP fd — the HTTP layer is done, and from here
+// the peer speaks WebSocket frames (use ws_send_frame / ws_recv_message).
+//
+// NOTE: the zhttp HttpConn wrapper is intentionally not freed here:
+// http_close would close the fd we are handing to the caller. The wrapper
+// (a few dozen bytes) leaks per accepted connection in v0.1.0; the fd does
+// not. Recorded in README "Known limitations".
+#[export]
+pub fun ws_server_accept(srv: &HttpServer) <WsAcceptResult> {
+    let fail <WsAcceptResult> = WsAcceptResult{ok: false, fd: -1, err: ""};
+    let conn <&HttpConn> = http_accept(srv);
+    let rr <HttpReadResult> = http_read_request(conn);
+    if (!rr.ok) {
+        http_free_read_result(&rr);
+        fail.err = "ws_server_accept: cannot read the HTTP request";
+        return fail;
+    }
+    let method <string> = rr.req.method;
+    let upgrade <string> = http_header_get(rr.req.headers, "Upgrade");
+    let connection <string> = http_header_get(rr.req.headers, "Connection");
+    let key <string> = http_header_get(rr.req.headers, "Sec-WebSocket-Key");
+    let version <string> = http_header_get(rr.req.headers, "Sec-WebSocket-Version");
+    if (!ws_check_handshake_headers(method, upgrade, connection, key, version)) {
+        http_write_raw(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        // http_free_read_result frees the request too — no separate
+        // http_free_request (that would double-free).
+        http_free_read_result(&rr);
+        fail.err = "ws_server_accept: not a valid WebSocket handshake";
+        return fail;
+    }
+    let accept <string> = ws_accept_key(key);
+    http_free_read_result(&rr);
+    let resp <string> = concat("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ", accept);
+    resp = concat(resp, "\r\n\r\n");
+    if (!http_write_raw(conn, resp)) {
+        fail.err = "ws_server_accept: cannot write the 101 response";
+        return fail;
+    }
+    let fd <int> = conn.fd;
+    return WsAcceptResult{ok: true, fd: fd, err: ""};
+}
+
+// --- frames (RFC 6455 section 5) ---
+//
+// Opcodes (int codes — no enum fields, backend limit 1):
+//   0 = continuation, 1 = text, 2 = binary,
+//   8 = close, 9 = ping, 10 = pong.
+// Close codes (section 7.4): 1000 normal, 1001 going away, 1002 protocol
+// error, 1003 unsupported data, 1007 invalid payload, 1008 policy violation,
+// 1009 message too big, 1011 internal error.
+
+#[export]
+pub struct WsDecodeResult {
+    pub:
+        ok <bool>,
+        fin <bool>,
+        opcode <int>,
+        masked <bool>,
+        payload <[char]>,
+        payload_len <int>,
+        consumed <int>,
+        err <string>,
+}
+
+#[export]
+pub fun ws_free_decode(r: &WsDecodeResult) <noret> {
+    delete r.payload;
+}
+
+// Encode one frame. mask_len == 0 -> unmasked (server use); mask_len == 4 ->
+// masked with mask_key (client use, RFC 6455 section 5.3: clients MUST mask).
+// Deterministic: the caller supplies the key, so tests can use fixed keys.
+#[export]
+pub fun ws_encode(fin: bool, opcode: int, payload: [char], payload_len: int, mask_key: [char], mask_len: int) <WsBytes> {
+    blame payload_len >= 0, "ws_encode: payload length must be non-negative";
+    blame mask_len == 0 || mask_len == 4, "ws_encode: mask is 0 or 4 bytes";
+    blame opcode >= 0 && opcode <= 15, "ws_encode: opcode is 4 bits";
+    let masked <bool> = mask_len == 4;
+    let hdr_len <int> = 2;
+    if (payload_len >= 126 && payload_len < 65536) { hdr_len = 4; }
+    if (payload_len >= 65536) { hdr_len = 10; }
+    if (masked) { hdr_len = hdr_len + 4; }
+    let total <int> = hdr_len + payload_len;
+    let out <[char]> = new [char, total + 1]{};
+    let b0 <uint> = cast<uint>(opcode);
+    if (fin) { b0 = bit_or(b0, cast<uint>(128)); }
+    out[0] = cast<char>(cast<int>(b0));
+    let b1 <uint> = cast<uint>(0);
+    if (masked) { b1 = cast<uint>(128); }
+    let o <int> = 2;
+    if (payload_len < 126) {
+        b1 = bit_or(b1, cast<uint>(payload_len));
+        out[1] = cast<char>(cast<int>(b1));
+    } else if (payload_len < 65536) {
+        b1 = bit_or(b1, cast<uint>(126));
+        out[1] = cast<char>(cast<int>(b1));
+        out[2] = cast<char>(payload_len / 256);
+        out[3] = cast<char>(payload_len % 256);
+        o = 4;
+    } else {
+        // 64-bit length: high 32 bits are zero (payload_len is a 32-bit int).
+        b1 = bit_or(b1, cast<uint>(127));
+        out[1] = cast<char>(cast<int>(b1));
+        out[2] = cast<char>(0);
+        out[3] = cast<char>(0);
+        out[4] = cast<char>(0);
+        out[5] = cast<char>(0);
+        let hi <uint> = cast<uint>(payload_len) >> cast<uint>(24);
+        out[6] = cast<char>(cast<int>(hi));
+        out[7] = cast<char>(cast<int>((cast<uint>(payload_len) >> cast<uint>(16)) % cast<uint>(256)));
+        out[8] = cast<char>(cast<int>((cast<uint>(payload_len) >> cast<uint>(8)) % cast<uint>(256)));
+        out[9] = cast<char>(cast<int>(cast<uint>(payload_len) % cast<uint>(256)));
+        o = 10;
+    }
+    if (masked) {
+        for (let i <int> = 0; i < 4; i++) { out[o + i] = mask_key[i]; }
+        o = o + 4;
+    }
+    for (let i <int> = 0; i < payload_len; i++) {
+        let byte <uint> = byte_at(payload, i);
+        if (masked) {
+            byte = bit_xor(byte, byte_at(mask_key, i % 4));
+        }
+        out[o + i] = cast<char>(cast<int>(byte));
+    }
+    out[total] = cast<char>(0);
+    return WsBytes{data: out, len: total};
+}
+
+// Decode one frame from the first len bytes of data. Reports how many bytes
+// the frame consumed so a caller can loop over a stream buffer. Incomplete
+// input -> ok=false, consumed=0 (read more and retry).
+#[export]
+pub fun ws_decode(data: [char], len: int) <WsDecodeResult> {
+    let fail <WsDecodeResult> = WsDecodeResult{ok: false, fin: false, opcode: 0, masked: false, payload: new [char, 1]{}, payload_len: 0, consumed: 0, err: ""};
+    if (len < 2) {
+        fail.err = "ws_decode: incomplete frame header";
+        return fail;
+    }
+    let b0 <uint> = byte_at(data, 0);
+    let b1 <uint> = byte_at(data, 1);
+    let fin <bool> = bit_and(b0, cast<uint>(128)) != cast<uint>(0);
+    let rsv <uint> = bit_and(b0, cast<uint>(112));
+    let opcode <int> = cast<int>(bit_and(b0, cast<uint>(15)));
+    if (rsv != cast<uint>(0)) {
+        fail.err = "ws_decode: RSV bits set without negotiated extensions";
+        return fail;
+    }
+    let masked <bool> = bit_and(b1, cast<uint>(128)) != cast<uint>(0);
+    let lenmark <uint> = bit_and(b1, cast<uint>(127));
+    let o <int> = 2;
+    let payload_len <int> = 0;
+    if (lenmark < cast<uint>(126)) {
+        payload_len = cast<int>(lenmark);
+    } else if (lenmark == cast<uint>(126)) {
+        if (len < 4) {
+            fail.err = "ws_decode: incomplete 16-bit length";
+            return fail;
+        }
+        payload_len = cast<int>(byte_at(data, 2)) * 256 + cast<int>(byte_at(data, 3));
+        o = 4;
+    } else {
+        if (len < 10) {
+            fail.err = "ws_decode: incomplete 64-bit length";
+            return fail;
+        }
+        // v0.1.0 cap: high 32 bits must be zero (payloads < 4 GB anyway).
+        if (byte_at(data, 2) != cast<uint>(0) || byte_at(data, 3) != cast<uint>(0)
+            || byte_at(data, 4) != cast<uint>(0) || byte_at(data, 5) != cast<uint>(0)) {
+            fail.err = "ws_decode: payload length exceeds v0.1.0 limits";
+            return fail;
+        }
+        let w <uint> = byte_at(data, 6) * cast<uint>(16777216)
+                     + byte_at(data, 7) * cast<uint>(65536)
+                     + byte_at(data, 8) * cast<uint>(256)
+                     + byte_at(data, 9);
+        // Keep it inside a positive int.
+        if (w >= cast<uint>(2147483647)) {
+            fail.err = "ws_decode: payload length exceeds v0.1.0 limits";
+            return fail;
+        }
+        payload_len = cast<int>(w);
+        o = 10;
+    }
+    // Sanity cap for one frame in v0.1.0 (16 MB).
+    if (payload_len > 16777216) {
+        fail.err = "ws_decode: frame exceeds 16 MB v0.1.0 cap";
+        return fail;
+    }
+    let key_off <int> = o;
+    if (masked) { o = o + 4; }
+    if (len < o + payload_len) {
+        fail.err = "ws_decode: incomplete frame payload";
+        return fail;
+    }
+    let payload <[char]> = new [char, payload_len + 1]{};
+    for (let i <int> = 0; i < payload_len; i++) {
+        let byte <uint> = byte_at(data, o + i);
+        if (masked) {
+            byte = bit_xor(byte, byte_at(data, key_off + (i % 4)));
+        }
+        payload[i] = cast<char>(cast<int>(byte));
+    }
+    payload[payload_len] = cast<char>(0);
+    let r <WsDecodeResult> = WsDecodeResult{ok: true, fin: fin, opcode: opcode, masked: masked, payload: payload, payload_len: payload_len, consumed: o + payload_len, err: ""};
+    return r;
+}
+
+// --- frame I/O over a connected fd ---
+
+// Read exactly len bytes, looping over short recvs. ok=false on close/error.
+priv fun ws_recv_exact(fd: int, len: int) <WsBytes> {
+    let buf <[char]> = new [char, len + 1]{};
+    let got <int> = 0;
+    while (got < len) {
+        let n <int> = c_recv(fd, &buf[got], len - got, 0);
+        if (n <= 0) {
+            delete buf;
+            return WsBytes{data: new [char, 1]{}, len: -1};
+        }
+        got = got + n;
+    }
+    buf[len] = cast<char>(0);
+    return WsBytes{data: buf, len: len};
+}
+
+// Send one frame. masked=true for client -> server traffic (RFC 6455 5.3);
+// the mask key is freshly random per frame.
+#[export]
+pub fun ws_send_frame(fd: int, fin: bool, opcode: int, payload: [char], payload_len: int, masked: bool) <bool> {
+    let key <[char]> = new [char, 5]{};
+    let key_len <int> = 0;
+    if (masked) {
+        let rk <[char]> = random_bytes(4);
+        for (let i <int> = 0; i < 4; i++) { key[i] = rk[i]; }
+        delete rk;
+        key_len = 4;
+    }
+    let enc <WsBytes> = ws_encode(fin, opcode, payload, payload_len, key, key_len);
+    delete key;
+    let ok <bool> = ws_send_all(fd, enc.data, enc.len);
+    delete enc.data;
+    return ok;
+}
+
+// Read one frame from the fd. ok=false when the peer closed or errored.
+#[export]
+pub fun ws_recv_frame(fd: int) <WsDecodeResult> {
+    let fail <WsDecodeResult> = WsDecodeResult{ok: false, fin: false, opcode: 0, masked: false, payload: new [char, 1]{}, payload_len: 0, consumed: 0, err: ""};
+    let hdr <WsBytes> = ws_recv_exact(fd, 2);
+    if (hdr.len < 0) {
+        fail.err = "ws_recv_frame: connection closed while reading the header";
+        return fail;
+    }
+    let b1 <uint> = byte_at(hdr.data, 1);
+    let lenmark <uint> = bit_and(b1, cast<uint>(127));
+    let masked <bool> = bit_and(b1, cast<uint>(128)) != cast<uint>(0);
+    let ext_len <int> = 0;
+    if (lenmark == cast<uint>(126)) { ext_len = 2; }
+    if (lenmark == cast<uint>(127)) { ext_len = 8; }
+    let rest_len <int> = ext_len;
+    if (masked) { rest_len = rest_len + 4; }
+    let rest <WsBytes> = WsBytes{data: new [char, 1]{}, len: 0};
+    if (rest_len > 0) {
+        delete rest.data;
+        rest = ws_recv_exact(fd, rest_len);
+        if (rest.len < 0) {
+            delete hdr.data;
+            fail.err = "ws_recv_frame: connection closed while reading extended header";
+            return fail;
+        }
+    }
+    // Peek the payload length the same way ws_decode does, so we know how
+    // much to read. (Duplicated header math, kept next to the read loop on
+    // purpose: one glance shows the read sizes.)
+    let payload_len <int> = 0;
+    if (lenmark < cast<uint>(126)) {
+        payload_len = cast<int>(lenmark);
+    } else if (lenmark == cast<uint>(126)) {
+        payload_len = cast<int>(byte_at(rest.data, 0)) * 256 + cast<int>(byte_at(rest.data, 1));
+    } else {
+        if (byte_at(rest.data, 0) != cast<uint>(0) || byte_at(rest.data, 1) != cast<uint>(0)
+            || byte_at(rest.data, 2) != cast<uint>(0) || byte_at(rest.data, 3) != cast<uint>(0)) {
+            delete hdr.data;
+            delete rest.data;
+            fail.err = "ws_recv_frame: payload length exceeds v0.1.0 limits";
+            return fail;
+        }
+        let w <uint> = byte_at(rest.data, 4) * cast<uint>(16777216)
+                     + byte_at(rest.data, 5) * cast<uint>(65536)
+                     + byte_at(rest.data, 6) * cast<uint>(256)
+                     + byte_at(rest.data, 7);
+        if (w >= cast<uint>(2147483647) || w > cast<uint>(16777216)) {
+            delete hdr.data;
+            delete rest.data;
+            fail.err = "ws_recv_frame: frame exceeds 16 MB v0.1.0 cap";
+            return fail;
+        }
+        payload_len = cast<int>(w);
+    }
+    let pay <WsBytes> = WsBytes{data: new [char, 1]{}, len: 0};
+    if (payload_len > 0) {
+        delete pay.data;
+        pay = ws_recv_exact(fd, payload_len);
+        if (pay.len < 0) {
+            delete hdr.data;
+            delete rest.data;
+            fail.err = "ws_recv_frame: connection closed while reading the payload";
+            return fail;
+        }
+    }
+    let total <int> = 2 + rest.len + pay.len;
+    let wire <[char]> = new [char, total + 1]{};
+    for (let i <int> = 0; i < 2; i++) { wire[i] = hdr.data[i]; }
+    for (let i <int> = 0; i < rest.len; i++) { wire[2 + i] = rest.data[i]; }
+    for (let i <int> = 0; i < pay.len; i++) { wire[2 + rest.len + i] = pay.data[i]; }
+    wire[total] = cast<char>(0);
+    delete hdr.data;
+    delete rest.data;
+    delete pay.data;
+    let fr <WsDecodeResult> = ws_decode(wire, total);
+    delete wire;
+    return fr;
+}
+
+// --- convenience senders ---
+
+#[export]
+pub fun ws_send_text(fd: int, text: string, masked: bool) <bool> {
+    let bytes <[char]> = to_chars(text);
+    let n <int> = bytes.length - 1;
+    let ok <bool> = ws_send_frame(fd, true, 1, bytes, n, masked);
+    delete bytes;
+    return ok;
+}
+
+#[export]
+pub fun ws_send_binary(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+    return ws_send_frame(fd, true, 2, payload, payload_len, masked);
+}
+
+#[export]
+pub fun ws_send_ping(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+    blame payload_len <= 125, "ws_send_ping: control payloads are at most 125 bytes";
+    return ws_send_frame(fd, true, 9, payload, payload_len, masked);
+}
+
+#[export]
+pub fun ws_send_pong(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+    blame payload_len <= 125, "ws_send_pong: control payloads are at most 125 bytes";
+    return ws_send_frame(fd, true, 10, payload, payload_len, masked);
+}
+
+// Close frame with a status code and optional UTF-8 reason.
+#[export]
+pub fun ws_send_close(fd: int, code: int, reason: string, masked: bool) <bool> {
+    blame code >= 1000 && code <= 4999, "ws_send_close: close code out of range";
+    let rb <[char]> = to_chars(reason);
+    let rn <int> = rb.length - 1;
+    let body <[char]> = new [char, rn + 3]{};
+    body[0] = cast<char>(code / 256);
+    body[1] = cast<char>(code % 256);
+    for (let i <int> = 0; i < rn; i++) { body[i + 2] = rb[i]; }
+    body[rn + 2] = cast<char>(0);
+    let ok <bool> = ws_send_frame(fd, true, 8, body, rn + 2, masked);
+    delete rb;
+    delete body;
+    return ok;
+}
+
+// --- message reassembly ---
+
+#[export]
+pub struct WsMsgResult {
+    pub:
+        ok <bool>,
+        opcode <int>,
+        payload <[char]>,
+        payload_len <int>,
+        closed <bool>,
+        err <string>,
+}
+
+#[export]
+pub fun ws_free_message(m: &WsMsgResult) <noret> {
+    delete m.payload;
+}
+
+// Read whole messages, reassembling fragmented ones (opcode 0 continuations).
+// Control frames are handled inline: ping -> auto pong, pong -> ignored,
+// close -> close echo + closed=true. from_client=true enforces the RFC 6455
+// 5.1 rule that client frames must be masked (server-side use).
+#[export]
+pub fun ws_recv_message(fd: int, from_client: bool) <WsMsgResult> {
+    let fail <WsMsgResult> = WsMsgResult{ok: false, opcode: 0, payload: new [char, 1]{}, payload_len: 0, closed: false, err: ""};
+    let msg_opcode <int> = -1;
+    let acc <[char]> = new [char, 1]{};
+    let acc_len <int> = 0;
+    while (true) {
+        let fr <WsDecodeResult> = ws_recv_frame(fd);
+        if (!fr.ok) {
+            delete acc;
+            fail.err = fr.err;
+            delete fr.payload;
+            return fail;
+        }
+        if (from_client && fr.opcode < 8 && !fr.masked) {
+            // RFC 6455 section 5.1: a server MUST close a connection that
+            // sends unmasked data frames.
+            ws_send_close(fd, 1002, "client frames must be masked", false);
+            delete fr.payload;
+            delete acc;
+            fail.err = "ws_recv_message: unmasked data frame from client";
+            return fail;
+        }
+        if (fr.opcode == 9) {
+            // ping -> pong with the same payload. Server replies unmasked,
+            // client replies masked.
+            ws_send_pong(fd, fr.payload, fr.payload_len, from_client);
+            delete fr.payload;
+            continue;
+        }
+        if (fr.opcode == 10) {
+            delete fr.payload;
+            continue;
+        }
+        if (fr.opcode == 8) {
+            // Echo the close and report the connection as closed.
+            let code <int> = 1000;
+            if (fr.payload_len >= 2) {
+                code = cast<int>(byte_at(fr.payload, 0)) * 256 + cast<int>(byte_at(fr.payload, 1));
+            }
+            let reason <string> = "";
+            if (fr.payload_len > 2) {
+                reason = from_chars(fr.payload, 2, fr.payload_len - 2);
+            }
+            ws_send_close(fd, code, reason, from_client);
+            delete fr.payload;
+            delete acc;
+            return WsMsgResult{ok: true, opcode: 8, payload: new [char, 1]{}, payload_len: 0, closed: true, err: ""};
+        }
+        if (fr.opcode == 1 || fr.opcode == 2) {
+            if (msg_opcode != -1) {
+                delete fr.payload;
+                delete acc;
+                fail.err = "ws_recv_message: new message before the fragmented one finished";
+                return fail;
+            }
+            msg_opcode = fr.opcode;
+        } else if (fr.opcode == 0) {
+            if (msg_opcode == -1) {
+                delete fr.payload;
+                delete acc;
+                fail.err = "ws_recv_message: stray continuation frame";
+                return fail;
+            }
+        } else {
+            delete fr.payload;
+            delete acc;
+            fail.err = "ws_recv_message: unknown opcode";
+            return fail;
+        }
+        // Append this fragment.
+        let new_len <int> = acc_len + fr.payload_len;
+        if (new_len > 16777216) {
+            delete fr.payload;
+            delete acc;
+            fail.err = "ws_recv_message: message exceeds 16 MB v0.1.0 cap";
+            return fail;
+        }
+        let grown <[char]> = new [char, new_len + 1]{};
+        for (let i <int> = 0; i < acc_len; i++) { grown[i] = acc[i]; }
+        for (let i <int> = 0; i < fr.payload_len; i++) { grown[acc_len + i] = fr.payload[i]; }
+        grown[new_len] = cast<char>(0);
+        delete acc;
+        delete fr.payload;
+        acc = grown;
+        acc_len = new_len;
+        if (fr.fin) {
+            return WsMsgResult{ok: true, opcode: msg_opcode, payload: acc, payload_len: acc_len, closed: false, err: ""};
+        }
+    }
+    delete acc;
+    return fail;
+}
+
+}

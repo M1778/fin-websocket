@@ -1,0 +1,13 @@
+[project]
+name = "fin-websocket"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "websocket.fin"
+
+[packages]
+zhttp = "M1778/zhttp@0.1.0"
+fin-crypto = "M1778/fin-crypto@0.1.0"
+
+[scripts]
+check = "finc src/websocket.fin"
+test = "finc tests/test_websocket.fin -I src -o test_websocket && ./test_websocket"
