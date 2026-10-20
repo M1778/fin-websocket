@@ -5,8 +5,8 @@ envpath = ".finn"
 entrypoint = "websocket.fin"
 
 [packages]
-zhttp = "M1778/zhttp@0.1.0"
-fin-crypto = "M1778/fin-crypto@0.1.1"  # 0.1.1 has the SHA-256 schedule fix (required)
+zhttp = "M1778/zhttp@61db2fa613b37a13d5fd893fa664da8bd6612f0e"
+fin-crypto = "M1778/fin-crypto@777990f2ef19ec7be6a69a628957ffb48da11974"
 
 [scripts]
 check = "finc src/websocket.fin"

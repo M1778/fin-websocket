@@ -26,25 +26,18 @@ Then `import { ... } from websocket::fin;`.
 
 ## Dependencies
 
-- [`M1778/zhttp@0.1.0`](https://github.com/M1778/zhttp) — server-side HTTP
-  Upgrade handshake parsing (`http_listen` / `http_accept` /
-  `http_read_request` / `http_write_raw`). Reused, not reimplemented.
-- [`M1778/fin-crypto@0.1.1`](https://github.com/M1778/fin-crypto) — CSPRNG
-  (`random_bytes`) for client keys and frame masks, `const_time_eq` for the
-  accept-key comparison.
+- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `61db2fa613b37a13d5fd893fa664da8bd6612f0e` — HTTP Upgrade parsing and transport.
+- [`M1778/fin-crypto`](https://github.com/M1778/fin-crypto), commit `777990f2ef19ec7be6a69a628957ffb48da11974` — CSPRNG and token comparison.
 - Fin std: `bits`, `strings`, `networking` (socket creation/address helpers).
 
-**Unreleased integration requirement:** this working tree must currently be built
-with the coordinated sibling `zhttp/src` snapshot, not the published
-`zhttp@0.1.0` manifest pin. That snapshot preserves bytes following HTTP headers
-and rejects duplicate WebSocket singleton headers. Both libraries now declare
-Linux `send`/`recv` with `ulong` byte counts (`size_t`) and `long` returns
-(`ssize_t`). The old zhttp and frozen std raw `c_send`/`c_recv` declarations use
-incompatible types: do not import those raw symbols into the same executable.
-The manifest is deliberately unchanged; a compatible zhttp release and pin
-update are a **release blocker**, not an existing published version.
-No new detach API is required: after successful handoff we free the existing
-plain `HttpConn` wrapper while preserving the caller-owned descriptor.
+`finn.toml` pins these pushed Git commits. The pinned zhttp preserves bytes after
+HTTP headers and rejects duplicate WebSocket singleton headers. Both libraries
+use Linux `send`/`recv` with `ulong` byte counts (`size_t`) and `long` returns
+(`ssize_t`); do not mix the old zhttp/frozen std raw `c_send`/`c_recv` bindings
+into the executable. No invented release tags are needed. The older
+`fin-websocket@0.1.0` tag does not include this work; use the current source.
+After successful handoff the plain `HttpConn` wrapper is freed while preserving
+the caller-owned descriptor.
 
 ### Why SHA-1 and base64 are vendored here
 
