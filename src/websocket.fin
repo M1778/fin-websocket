@@ -26,39 +26,34 @@ import { bit_and, bit_or, bit_xor, bit_not, rotate_left } from bits::std;
 import { to_chars, from_chars, equals, concat, substr, find, trim, to_lower, len, starts_with, free_str } from strings::std;
 import { c_socket, c_connect, c_close, c_inet_addr } from networking::std;
 import { random_bytes, const_time_eq } from crypto::fin;
-import { http_listen, http_accept, http_read_request, http_header_get, http_free_read_result, http_server_close, http_close, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
+import { http_listen, http_accept, http_read_request, http_header_get, http_free_read_result, http_server_close, http_close, http_detach, http_sockaddr, http_socket_invalid, http_socket_close, http_socket_shutdown, http_socket_failed, http_socket_interrupted, http_socket_dial, http_socket_read, http_socket_write, http_socket_read_exact, http_socket_peek, http_socket_read_at, http_socket_peek_at, HttpSocket, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
 }%
 
 namespace fin {
 
-// --- raw send: std's c_send takes a `string`, which cannot carry binary
-// frame bytes (strlen-truncated). This matches the real C ABI exactly:
-// ssize_t send(int sockfd, const void *buf, size_t len, int flags);
-#[llvm_name="send"]
-@define ws_send(fd: int, buf: &char, len: ulong, flags: int) <long>;
+// --- raw send and receive ---
+//
+// The socket handle, the buffer ABI and the error source all come from
+// `zhttp`, which selects them for the native target (ADR 0051 addendum).
+// Redeclaring `send`/`recv` here is what broke this module when the two
+// libraries disagreed about the handle width: POSIX wants `ssize_t` and a
+// `size_t` length, Winsock wants `int` for both, and a `SOCKET` is a pointer
+// width, not an `int`. One declaration, one ABI, one owner.
+//
+// `zhttp`'s raw read and write are binary-safe: a WebSocket frame carries NUL
+// bytes and arbitrary binary payloads, and a `string`-typed send would
+// truncate them at the first NUL.
 
-#[llvm_name="recv"]
-@define ws_recv(fd: int, buf: &char, len: ulong, flags: int) <long>;
+// MSG_PEEK is 2 on Linux, Darwin and Winsock.
+priv fun ws_peek_flag() <int> { return 2; }
 
-#[llvm_name="__errno_location"]
-@define ws_errno() <&int>;
-
-priv fun ws_read(fd: int, buf: &char, size: int, flags: int) <int> {
+// Reads into `buf` at `offset`. `flags` is either 0 for a consuming read or
+// the peek flag for a non-consuming one.
+priv fun ws_read_at(fd: HttpSocket, buf: [char], offset: int, size: int, flags: int) <int> {
     // All callers bound sizes to 16 MiB, so positive returns fit int.
-    while (true) {
-        let count <long> = ws_recv(fd, buf, cast<ulong>(size), flags);
-        if (count < 0) {
-            let error <&int> = ws_errno();
-            if (*error == 4) { continue; } // EINTR, Linux
-            return -1;
-        }
-        return cast<int>(count);
-    }
-    return -1;
+    if (flags == ws_peek_flag()) { return http_socket_peek_at(fd, buf, offset, size); }
+    return http_socket_read_at(fd, buf, offset, size);
 }
-
-#[llvm_name="shutdown"]
-@define ws_shutdown(fd: int, how: int) <int>;
 
 // --- private helpers ---
 
@@ -532,7 +527,7 @@ pub fun ws_check_handshake_headers(method: string, upgrade: string, connection: 
 pub struct WsClientResult {
     pub:
         ok <bool>,
-        fd <int>,
+        fd <HttpSocket>,
         err <string>,
 }
 
@@ -549,24 +544,19 @@ priv fun ws_sockaddr(parsed: int, port: int) <[int]> {
 }
 
 // Send exactly len bytes, looping over short sends. False on any error.
-priv fun ws_send_all(fd: int, data: [char], len: int) <bool> {
+priv fun ws_send_all(fd: HttpSocket, data: [char], len: int) <bool> {
     let sent <int> = 0;
     while (sent < len) {
         // &data[sent]: address of an element, the same idiom std uses
         // (&buffer[0]).
-        let n <long> = ws_send(fd, &data[sent], cast<ulong>(len - sent), 16384); // Linux MSG_NOSIGNAL
-        if (n < 0) {
-            let error <&int> = ws_errno();
-            if (*error == 4) { continue; }
-            return false;
-        }
-        if (n == 0) { return false; }
-        sent = sent + cast<int>(n);
+        // The shared write sends the whole buffer, looping over short writes.
+        if (!http_socket_write(fd, data, len)) { return false; }
+        sent = len;
     }
     return true;
 }
 
-priv fun ws_send_str_all(fd: int, s: string) <bool> {
+priv fun ws_send_str_all(fd: HttpSocket, s: string) <bool> {
     let bytes <[char]> = to_chars(s);
     let n <int> = bytes.length - 1;
     let ok <bool> = ws_send_all(fd, bytes, n);
@@ -576,11 +566,11 @@ priv fun ws_send_str_all(fd: int, s: string) <bool> {
 
 // Receive only HTTP headers. Peek first, then consume through the first
 // terminator; bytes of a coalesced WebSocket frame remain in the socket.
-priv fun ws_recv_headers(fd: int, cap: int) <WsBytes> {
+priv fun ws_recv_headers(fd: HttpSocket, cap: int) <WsBytes> {
     let buf <[char]> = new [char, cap + 1]{};
     let total <int> = 0;
     while (total < cap) {
-        let n <int> = ws_read(fd, &buf[total], cap - total, 2);
+        let n <int> = ws_read_at(fd, buf, total, cap - total, 2);
         if (n <= 0) { break; }
         let end <int> = -1;
         let start <int> = total - 3;
@@ -595,7 +585,7 @@ priv fun ws_recv_headers(fd: int, cap: int) <WsBytes> {
         if (end >= 0) { take = end - total; }
         let consumed <int> = 0;
         while (consumed < take) {
-            let got <int> = ws_read(fd, &buf[total + consumed], take - consumed, 0);
+            let got <int> = ws_read_at(fd, buf, total + consumed, take - consumed, 0);
             if (got <= 0) {
                 delete buf;
                 return WsBytes{data: new [char, 1]{}, len: -1};
@@ -629,7 +619,7 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
         fail.err = "ws_client_connect: cannot parse the address as a dotted quad";
         return fail;
     }
-    let fd <int> = c_socket(2, 1, 0);
+    let fd <HttpSocket> = c_socket(2, 1, 0);
     if (fd < 0) {
         fail.err = "ws_client_connect: cannot open a socket";
         return fail;
@@ -685,7 +675,7 @@ pub fun ws_conn_close(fd: int) <bool> {
 pub struct WsAcceptResult {
     pub:
         ok <bool>,
-        fd <int>,
+        fd <HttpSocket>,
         err <string>,
 }
 
@@ -749,7 +739,7 @@ pub fun ws_server_accept(srv: &HttpServer) <WsAcceptResult> {
         fail.err = "ws_server_accept: cannot write the 101 response";
         return fail;
     }
-    let fd <int> = conn.fd;
+    let fd <HttpSocket> = conn.fd;
     delete conn;
     return WsAcceptResult{ok: true, fd: fd, err: ""};
 }
@@ -956,11 +946,11 @@ pub fun ws_decode(data: [char], len: int) <WsDecodeResult> {
 // --- frame I/O over a connected fd ---
 
 // Read exactly len bytes, looping over short recvs. ok=false on close/error.
-priv fun ws_recv_exact(fd: int, len: int) <WsBytes> {
+priv fun ws_recv_exact(fd: HttpSocket, len: int) <WsBytes> {
     let buf <[char]> = new [char, len + 1]{};
     let got <int> = 0;
     while (got < len) {
-        let n <int> = ws_read(fd, &buf[got], len - got, 0);
+        let n <int> = ws_read_at(fd, buf, got, len - got, 0);
         if (n <= 0) {
             delete buf;
             return WsBytes{data: new [char, 1]{}, len: -1};
@@ -974,7 +964,7 @@ priv fun ws_recv_exact(fd: int, len: int) <WsBytes> {
 // Send one frame. masked=true for client -> server traffic (RFC 6455 5.3);
 // the mask key is freshly random per frame.
 #[export]
-pub fun ws_send_frame(fd: int, fin: bool, opcode: int, payload: [char], payload_len: int, masked: bool) <bool> {
+pub fun ws_send_frame(fd: HttpSocket, fin: bool, opcode: int, payload: [char], payload_len: int, masked: bool) <bool> {
     if (payload_len < 0 || payload_len > payload.length || payload_len > 16777216) { return false; }
     if (opcode != 0 && opcode != 1 && opcode != 2 && opcode != 8 && opcode != 9 && opcode != 10) { return false; }
     if (opcode >= 8 && (!fin || payload_len > 125)) { return false; }
@@ -997,14 +987,14 @@ pub fun ws_send_frame(fd: int, fin: bool, opcode: int, payload: [char], payload_
 
 // Read directly into the returned payload, with no wire-buffer copy. Header
 // validation (including role and remaining message budget) precedes body reads.
-priv fun ws_recv_checked(fd: int, role: int, active: bool, remaining: int) <WsDecodeResult> {
+priv fun ws_recv_checked(fd: HttpSocket, role: int, active: bool, remaining: int) <WsDecodeResult> {
     let head <[char]> = new [char, 14]{};
     let used <int> = 0;
     let target <int> = 2;
     let h <WsHeader> = ws_header(head, 0, role);
     while (true) {
         while (used < target) {
-            let got <int> = ws_read(fd, &head[used], target - used, 0);
+            let got <int> = ws_read_at(fd, head, used, target - used, 0);
             if (got <= 0) { delete head; return ws_decode_error(0, "connection closed while reading header"); }
             used = used + got;
         }
@@ -1038,14 +1028,14 @@ priv fun ws_recv_checked(fd: int, role: int, active: bool, remaining: int) <WsDe
 // Low-level role-neutral reader. Use ws_recv_message for masking and message
 // sequencing enforcement; ok=false distinguishes protocol errors via error_code.
 #[export]
-pub fun ws_recv_frame(fd: int) <WsDecodeResult> {
+pub fun ws_recv_frame(fd: HttpSocket) <WsDecodeResult> {
     return ws_recv_checked(fd, -1, false, 16777216);
 }
 
 // --- convenience senders ---
 
 #[export]
-pub fun ws_send_text(fd: int, text: string, masked: bool) <bool> {
+pub fun ws_send_text(fd: HttpSocket, text: string, masked: bool) <bool> {
     let bytes <[char]> = to_chars(text);
     let n <int> = bytes.length - 1;
     let ok <bool> = ws_send_frame(fd, true, 1, bytes, n, masked);
@@ -1054,25 +1044,25 @@ pub fun ws_send_text(fd: int, text: string, masked: bool) <bool> {
 }
 
 #[export]
-pub fun ws_send_binary(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+pub fun ws_send_binary(fd: HttpSocket, payload: [char], payload_len: int, masked: bool) <bool> {
     return ws_send_frame(fd, true, 2, payload, payload_len, masked);
 }
 
 #[export]
-pub fun ws_send_ping(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+pub fun ws_send_ping(fd: HttpSocket, payload: [char], payload_len: int, masked: bool) <bool> {
     if (payload_len > 125) { return false; }
     return ws_send_frame(fd, true, 9, payload, payload_len, masked);
 }
 
 #[export]
-pub fun ws_send_pong(fd: int, payload: [char], payload_len: int, masked: bool) <bool> {
+pub fun ws_send_pong(fd: HttpSocket, payload: [char], payload_len: int, masked: bool) <bool> {
     if (payload_len > 125) { return false; }
     return ws_send_frame(fd, true, 10, payload, payload_len, masked);
 }
 
 // Close frame with a status code and optional UTF-8 reason.
 #[export]
-pub fun ws_send_close(fd: int, code: int, reason: string, masked: bool) <bool> {
+pub fun ws_send_close(fd: HttpSocket, code: int, reason: string, masked: bool) <bool> {
     if (!ws_valid_close_code(code)) { return false; }
     let rb <[char]> = to_chars(reason);
     let rn <int> = rb.length - 1;
@@ -1110,7 +1100,13 @@ pub fun ws_free_message(m: &WsMsgResult) <noret> {
 // Read complete messages. All peer errors are recoverable; on protocol
 // failure send a role-correct Close and shut down I/O. Caller still owns fd.
 #[export]
-pub fun ws_recv_message(fd: int, from_client: bool) <WsMsgResult> {
+priv fun ws_message_error(fd: HttpSocket, masked: bool, code: int, message: string) <WsMsgResult> {
+    if (code != 0) { ws_send_close(fd, code, "", masked); }
+    http_socket_shutdown(fd);
+    return WsMsgResult{ok: false, opcode: 0, payload: new [char, 1]{}, payload_len: 0, closed: true, error_code: code, err: message};
+}
+
+pub fun ws_recv_message(fd: HttpSocket, from_client: bool) <WsMsgResult> {
     let msg_opcode <int> = -1;
     let acc <[char]> = new [char, 1]{};
     let acc_len <int> = 0;
@@ -1137,7 +1133,7 @@ pub fun ws_recv_message(fd: int, from_client: bool) <WsMsgResult> {
             let sent <bool> = ws_send_frame(fd, true, 8, fr.payload, fr.payload_len, masked);
             delete fr.payload;
             delete acc;
-            ws_shutdown(fd, 2);
+            http_socket_shutdown(fd);
             return WsMsgResult{ok: sent, opcode: 8, payload: new [char, 1]{}, payload_len: 0, closed: true, error_code: 0, err: sent : "" ? "cannot echo close"};
         }
         if (msg_opcode == -1) { msg_opcode = fr.opcode; }
@@ -1171,10 +1167,5 @@ pub fun ws_recv_message(fd: int, from_client: bool) <WsMsgResult> {
     return ws_message_error(fd, masked, 0, "unreachable receive state");
 }
 
-priv fun ws_message_error(fd: int, masked: bool, code: int, message: string) <WsMsgResult> {
-    if (code != 0) { ws_send_close(fd, code, "", masked); }
-    ws_shutdown(fd, 2);
-    return WsMsgResult{ok: false, opcode: 0, payload: new [char, 1]{}, payload_len: 0, closed: true, error_code: code, err: message};
-}
 
 }

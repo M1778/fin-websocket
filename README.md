@@ -26,15 +26,20 @@ Then `import { ... } from websocket::fin;`.
 
 ## Dependencies
 
-- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `61db2fa613b37a13d5fd893fa664da8bd6612f0e` — HTTP Upgrade parsing and transport.
+- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `3ec72c6ddd47c41255cb2295ab107320a05708ce` — HTTP Upgrade parsing and the native socket transport.
 - [`M1778/fin-crypto`](https://github.com/M1778/fin-crypto), commit `777990f2ef19ec7be6a69a628957ffb48da11974` — CSPRNG and token comparison.
 - Fin std: `bits`, `strings`, `networking` (socket creation/address helpers).
 
 `finn.toml` pins these pushed Git commits. The pinned zhttp preserves bytes after
 HTTP headers and rejects duplicate WebSocket singleton headers. Both libraries
-use Linux `send`/`recv` with `ulong` byte counts (`size_t`) and `long` returns
-(`ssize_t`); do not mix the old zhttp/frozen std raw `c_send`/`c_recv` bindings
-into the executable. No invented release tags are needed. The older
+take the socket handle, the buffer types and the error source from one place:
+zhttp's native transport, selected from the compiler's native target (ADR 0051
+addendum). This module therefore declares no `send`/`recv` of its own — two
+declarations of the same linker symbol with different signatures is exactly
+how the two libraries used to disagree. `MSG_NOSIGNAL` on Linux suppresses the
+signal a write to a closed peer would otherwise raise; macOS sets
+`SO_NOSIGPIPE` on the socket instead, and Windows reports the error instead.
+No invented release tags are needed. The older
 `fin-websocket@0.1.0` tag does not include this work; use the current source.
 After successful handoff the plain `HttpConn` wrapper is freed while preserving
 the caller-owned descriptor.
@@ -158,10 +163,12 @@ done
 
 ## Known limitations (v0.1.0)
 
-- Linux blocking TCP, IPv4 dotted quads only; no hostname resolution or TLS.
-  Linux-specific MSG_NOSIGNAL avoids process termination on disconnected peers;
-  short I/O and EINTR are retried. No read/write deadlines: an indefinitely
-  slow peer or unending empty/control frames can occupy a blocking caller.
+- Blocking TCP, IPv4 dotted quads only; no hostname resolution or TLS.
+  Short I/O and EINTR are retried. On Linux `MSG_NOSIGNAL` avoids process
+  termination on disconnected peers; on macOS `SO_NOSIGPIPE` does the same, and
+  on Windows a write to a closed peer is reported as an error. No read/write
+  deadlines: an indefinitely slow peer or unending empty/control frames can
+  occupy a blocking caller.
 - One frame / one reassembled message capped at 16 MiB. Geometric accumulator
   growth makes fragmented reassembly linear in bytes plus frame count; empty
   fragments do not copy the accumulated prefix.
