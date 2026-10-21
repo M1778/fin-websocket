@@ -24,7 +24,6 @@
 #[stdimport] %{
 import { bit_and, bit_or, bit_xor, bit_not, rotate_left } from bits::std;
 import { to_chars, from_chars, equals, concat, substr, find, trim, to_lower, len, starts_with, free_str } from strings::std;
-import { c_socket, c_connect, c_close, c_inet_addr } from networking::std;
 import { random_bytes, const_time_eq } from crypto::fin;
 import { http_listen, http_accept, http_read_request, http_header_get, http_free_read_result, http_server_close, http_close, http_detach, http_sockaddr, http_socket_invalid, http_socket_close, http_socket_shutdown, http_socket_failed, http_socket_interrupted, http_socket_dial, http_socket_read, http_socket_write, http_socket_read_exact, http_socket_peek, http_socket_read_at, http_socket_peek_at, HttpSocket, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
 }%
@@ -531,17 +530,6 @@ pub struct WsClientResult {
         err <string>,
 }
 
-// Build a sockaddr_in the way std networking.fin does (family + port/address
-// in network order packed into [int, 4]). `parsed` is c_inet_addr's answer,
-// checked by the caller.
-priv fun ws_sockaddr(parsed: int, port: int) <[int]> {
-    let addr <[int]> = new [int, 4]{};
-    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 + cast<long>(port % 256) * 16777216);
-    addr[1] = parsed;
-    addr[2] = 0;
-    addr[3] = 0;
-    return addr;
-}
 
 // Send exactly len bytes, looping over short sends. False on any error.
 priv fun ws_send_all(fd: HttpSocket, data: [char], len: int) <bool> {
@@ -607,28 +595,16 @@ priv fun ws_recv_headers(fd: HttpSocket, cap: int) <WsBytes> {
 // Hostnames are NOT resolved — dotted quads only, like std networking.fin.
 #[export]
 pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult> {
-    let fail <WsClientResult> = WsClientResult{ok: false, fd: -1, err: ""};
+    let fail <WsClientResult> = WsClientResult{ok: false, fd: http_socket_invalid(), err: ""};
     if (port <= 0 || port > 65535) {
         fail.err = "ws_client_connect: port must be in 1..65535";
         return fail;
     }
-    // Resolve before opening anything: a bad address is an error, not an
-    // abort (blame would leak the socket).
-    let parsed <int> = c_inet_addr(host);
-    if (parsed == -1) {
-        fail.err = "ws_client_connect: cannot parse the address as a dotted quad";
-        return fail;
-    }
-    let fd <HttpSocket> = c_socket(2, 1, 0);
-    if (fd < 0) {
-        fail.err = "ws_client_connect: cannot open a socket";
-        return fail;
-    }
-    let addr <[int]> = ws_sockaddr(parsed, port);
-    let err <int> = c_connect(fd, &addr[0], 16);
-    delete addr;
-    if (err != 0) {
-        c_close(fd);
+    // Dial through the shared transport: it owns the socket handle, the
+    // address layout and the error source for the native target. A bad
+    // address is an error, not an abort (blame would leak the socket).
+    let fd <HttpSocket> = http_socket_dial(host, port);
+    if (fd == http_socket_invalid()) {
         fail.err = "ws_client_connect: cannot connect";
         return fail;
     }
@@ -638,7 +614,7 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
     free_str(req);
     if (!sent) {
         free_str(key);
-        c_close(fd);
+        http_socket_close(fd);
         fail.err = "ws_client_connect: cannot send the handshake";
         return fail;
     }
@@ -646,7 +622,7 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
     if (resp.len < 0) {
         delete resp.data;
         free_str(key);
-        c_close(fd);
+        http_socket_close(fd);
         fail.err = "ws_client_connect: no handshake response";
         return fail;
     }
@@ -656,7 +632,7 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
     free_str(resp_s);
     free_str(key);
     if (!valid) {
-        c_close(fd);
+        http_socket_close(fd);
         fail.err = "ws_client_connect: bad 101 response or accept key";
         return fail;
     }
@@ -666,7 +642,7 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
 #[export]
 pub fun ws_conn_close(fd: int) <bool> {
     if (fd < 0) { return false; }
-    return c_close(fd) == 0;
+    return http_socket_close(fd);
 }
 
 // --- server side (handshake via zhttp) ---
@@ -699,7 +675,7 @@ pub fun ws_server_close(srv: &HttpServer) <noret> {
 // failure; on success transfer fd ownership and delete only its wrapper.
 #[export]
 pub fun ws_server_accept(srv: &HttpServer) <WsAcceptResult> {
-    let fail <WsAcceptResult> = WsAcceptResult{ok: false, fd: -1, err: ""};
+    let fail <WsAcceptResult> = WsAcceptResult{ok: false, fd: http_socket_invalid(), err: ""};
     let conn <&HttpConn> = http_accept(srv);
     let rr <HttpReadResult> = http_read_request(conn);
     if (!rr.ok) {
