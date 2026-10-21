@@ -640,8 +640,8 @@ pub fun ws_client_connect(host: string, port: int, path: string) <WsClientResult
 }
 
 #[export]
-pub fun ws_conn_close(fd: int) <bool> {
-    if (fd < 0) { return false; }
+pub fun ws_conn_close(fd: HttpSocket) <bool> {
+    if (fd == http_socket_invalid()) { return false; }
     return http_socket_close(fd);
 }
 
