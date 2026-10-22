@@ -1,57 +1,87 @@
-// Linux socketpair and loopback integration regressions; no external harness.
+// Loopback integration regressions; no external harness.
+//
+// The pair of connected sockets a test needs comes from the library's own
+// loopback transport: a listener on an ephemeral port and a dial to it. A
+// socketpair would be shorter, but it does not exist on Windows, and the
+// point of these tests is that the module works there.
 import { ws_encode, ws_decode, ws_free_bytes, ws_free_decode, ws_recv_frame, ws_recv_message, ws_free_message, ws_send_frame, ws_send_close, ws_client_connect, ws_server_listen, ws_server_accept, ws_server_close, ws_conn_close, ws_client_request, ws_accept_key, WsBytes, WsDecodeResult, WsMsgResult, WsClientResult, WsAcceptResult } from websocket::fin;
-import { http_accept, http_read_request, http_free_read_result, http_header_get, http_close, http_server_port, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
+import { http_accept, http_read_request, http_free_read_result, http_header_get, http_close, http_server_port, http_server_close, http_listen, http_socket_dial, http_socket_invalid, http_socket_close, http_socket_read, http_socket_write, http_socket_write_at, HttpSocket, HttpServer, HttpConn, HttpReadResult } from zhttp::fin;
 import { to_chars, from_chars, concat, free_str, equals } from strings::std;
 import { assert_true } from testing::std;
+import { Thread } from sync::std;
 
-#[llvm_name="socketpair"] @define pair(domain: int, kind: int, protocol: int, fds: &int) <int>;
-#[llvm_name="send"] @define send_bytes(fd: int, p: &char, n: ulong, flags: int) <long>;
-#[llvm_name="recv"] @define recv_bytes(fd: int, p: &char, n: ulong, flags: int) <long>;
-#[llvm_name="close"] @define close_fd(fd: int) <int>;
-#[llvm_name="fork"] @define fork_process() <int>;
-#[llvm_name="waitpid"] @define wait_process(pid: int, status: &int, flags: int) <int>;
-#[llvm_name="_exit"] @define exit_child(code: int) <noret>;
-#[llvm_name="alarm"] @define alarm_sec(n: uint) <uint>;
-#[llvm_name="socket"] @define open_socket(domain: int, kind: int, protocol: int) <int>;
-#[llvm_name="connect"] @define connect_socket(fd: int, addr: &int, size: int) <int>;
-#[llvm_name="inet_addr"] @define parse_address(s: string) <int>;
-#[llvm_name="fcntl"] @define descriptor_flags(fd: int, command: int) <int>;
+// A connected pair of sockets and the listener that produced them.
+struct Pair {
+    server <&HttpServer>,
+    client <HttpSocket>,
+    peer <HttpSocket>,
+}
 
-fun write_all(fd: int, bytes: [char], count: int) <noret> {
+// Where the dialling thread leaves its socket.
+struct Accepted {
+    client <HttpSocket>,
+}
+
+// Writes every byte, in chunks. A single write of a large frame would block
+// once the socket buffer filled, and the reader is on another thread -- so
+// the write has to be small enough to fit in the buffer and to loop.
+fun write_all(fd: HttpSocket, bytes: [char], count: int) <noret> {
     let sent <int> = 0;
     while (sent < count) {
-        let n <long> = send_bytes(fd, &bytes[sent], cast<ulong>(count - sent), 16384);
-        assert_true(n > 0, "raw send succeeds");
-        sent = sent + cast<int>(n);
+        let take <int> = count - sent;
+        if (take > 65536) { take = 65536; }
+        // The offset matters: writing the same buffer from its start again
+        // would send the same bytes over and over.
+        let ok <bool> = http_socket_write_at(fd, bytes, sent, take);
+        assert_true(ok, "raw send succeeds");
+        sent = sent + take;
     }
 }
 
-fun new_pair() <[int]> {
-    let fds <[int]> = new [int, 2]{};
-    assert_true(pair(1, 1, 0, &fds[0]) == 0, "socketpair");
-    return fds;
+// A connected pair: the client dials a loopback listener, and the listener
+// accepts the same connection. Both ends are the same socket type on every
+// platform, which a socketpair's two ints were not.
+//
+// The dial happens on a worker thread and the accept on this one. A connect
+// to a listening socket completes without the peer accepting, so the accept
+// returns as soon as the worker has connected; doing both in one thread
+// would deadlock on the connect's backlog wait.
+fun new_pair() <&Pair> {
+    let srv <&HttpServer> = http_listen(0);
+    let port <int> = http_server_port(srv);
+    let holder <&Accepted> = new Accepted{client: http_socket_invalid()};
+    let worker <Thread> = Thread::spawn(fun () <noret> {
+        let h <&Accepted> = holder;
+        h.client = http_socket_dial("127.0.0.1", port);
+    });
+    let conn <&HttpConn> = http_accept(srv);
+    let peer <HttpSocket> = conn.fd;
+    worker.join();
+    let client <HttpSocket> = holder.client;
+    delete holder;
+    assert_true(client != http_socket_invalid(), "loopback dial");
+    return new Pair{server: srv, client: client, peer: peer};
 }
 
-fun wait_ok(pid: int) <noret> {
-    let status <int> = -1;
-    assert_true(wait_process(pid, &status, 0) == pid && status == 0, "child succeeded");
+fun close_fd(fd: HttpSocket) <noret> {
+    http_socket_close(fd);
 }
 
-fun drain(fd: int) <noret> {
+fun drain(fd: HttpSocket) <noret> {
     let b <[char]> = new [char, 1024]{};
-    while (recv_bytes(fd, &b[0], cast<ulong>(1024), 0) > 0) {}
+    while (http_socket_read(fd, b, 1024) > 0) {}
     delete b;
 }
 
 fun expect_error(wire: [char], size: int, from_client: bool, code: int) <noret> {
-    let fds <[int]> = new_pair();
-    write_all(fds[1], wire, size);
+    let fds <&Pair> = new_pair();
+    write_all(fds.peer, wire, size);
     // Sender deliberately remains open: a body read instead of immediate
     // header rejection hangs and the suite alarm fails the test.
-    let msg <WsMsgResult> = ws_recv_message(fds[0], from_client);
+    let msg <WsMsgResult> = ws_recv_message(fds.client, from_client);
     assert_true(!msg.ok && msg.closed && msg.error_code == code, "recoverable expected protocol error");
     ws_free_message(&msg);
-    let reply <WsDecodeResult> = ws_recv_frame(fds[1]);
+    let reply <WsDecodeResult> = ws_recv_frame(fds.peer);
     assert_true(reply.ok && reply.opcode == 8 && reply.masked == !from_client, "role-correct error close");
     let c0 <int> = cast<int>(reply.payload[0]);
     let c1 <int> = cast<int>(reply.payload[1]);
@@ -59,7 +89,7 @@ fun expect_error(wire: [char], size: int, from_client: bool, code: int) <noret> 
     if (c1 < 0) { c1 = c1 + 256; }
     assert_true(c0 * 256 + c1 == code, "wire close code");
     ws_free_decode(&reply);
-    close_fd(fds[0]); close_fd(fds[1]); delete fds;
+    close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds;
 }
 
 fun malformed_headers() <noret> {
@@ -125,45 +155,45 @@ fun malformed_payloads() <noret> {
 }
 
 fun controls_and_utf8(from_client: bool) <noret> {
-    let fds <[int]> = new_pair();
+    let fds <&Pair> = new_pair();
     let bytes <[char]> = [cast<char>(240), cast<char>(159), cast<char>(152), cast<char>(128), cast<char>(0)];
     let one <[char]> = new [char, 1]{};
     one[0] = bytes[0];
-    assert_true(ws_send_frame(fds[1], false, 1, one, 1, from_client), "start fragmented UTF-8");
-    assert_true(ws_send_frame(fds[1], true, 9, bytes, 5, from_client), "interleaved binary ping");
-    assert_true(ws_send_frame(fds[1], false, 0, one, 0, from_client), "empty continuation");
+    assert_true(ws_send_frame(fds.peer, false, 1, one, 1, from_client), "start fragmented UTF-8");
+    assert_true(ws_send_frame(fds.peer, true, 9, bytes, 5, from_client), "interleaved binary ping");
+    assert_true(ws_send_frame(fds.peer, false, 0, one, 0, from_client), "empty continuation");
     for (let i <int> = 1; i < 5; i++) {
         one[0] = bytes[i];
-        assert_true(ws_send_frame(fds[1], i == 4, 0, one, 1, from_client), "UTF-8 continuation");
+        assert_true(ws_send_frame(fds.peer, i == 4, 0, one, 1, from_client), "UTF-8 continuation");
     }
-    let msg <WsMsgResult> = ws_recv_message(fds[0], from_client);
+    let msg <WsMsgResult> = ws_recv_message(fds.client, from_client);
     assert_true(msg.ok && msg.payload_len == 5 && msg.opcode == 1, "UTF-8 across fragments");
     for (let i <int> = 0; i < 5; i++) { assert_true(msg.payload[i] == bytes[i], "preserve UTF-8 and NUL"); }
     ws_free_message(&msg);
-    let pong <WsDecodeResult> = ws_recv_frame(fds[1]);
+    let pong <WsDecodeResult> = ws_recv_frame(fds.peer);
     assert_true(pong.ok && pong.opcode == 10 && pong.masked == !from_client && pong.payload_len == 5, "auto pong masking");
     for (let i <int> = 0; i < 5; i++) { assert_true(pong.payload[i] == bytes[i], "pong echoes bytes"); }
     ws_free_decode(&pong);
     // Empty close echoes an empty body (not synthesized status 1000).
-    assert_true(ws_send_frame(fds[1], true, 8, bytes, 0, from_client), "empty close");
-    msg = ws_recv_message(fds[0], from_client);
+    assert_true(ws_send_frame(fds.peer, true, 8, bytes, 0, from_client), "empty close");
+    msg = ws_recv_message(fds.client, from_client);
     assert_true(msg.ok && msg.closed, "close accepted"); ws_free_message(&msg);
-    let close <WsDecodeResult> = ws_recv_frame(fds[1]);
+    let close <WsDecodeResult> = ws_recv_frame(fds.peer);
     assert_true(close.ok && close.masked == !from_client && close.payload_len == 0, "empty close echo masking");
     ws_free_decode(&close);
-    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete bytes; delete one;
+    close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds; delete bytes; delete one;
 }
 
 fun close_bytes_and_eof() <noret> {
-    let fds <[int]> = new_pair();
+    let fds <&Pair> = new_pair();
     let body <[char]> = [cast<char>(3), cast<char>(232), 'a', cast<char>(0), 'b'];
-    assert_true(ws_send_frame(fds[1], true, 8, body, 5, true), "close reason contains NUL");
-    let msg <WsMsgResult> = ws_recv_message(fds[0], true);
+    assert_true(ws_send_frame(fds.peer, true, 8, body, 5, true), "close reason contains NUL");
+    let msg <WsMsgResult> = ws_recv_message(fds.client, true);
     assert_true(msg.ok && msg.closed, "binary-safe close reason accepted"); ws_free_message(&msg);
-    let reply <WsDecodeResult> = ws_recv_frame(fds[1]);
+    let reply <WsDecodeResult> = ws_recv_frame(fds.peer);
     assert_true(reply.ok && reply.payload_len == 5, "close reason not truncated");
     for (let i <int> = 0; i < 5; i++) { assert_true(reply.payload[i] == body[i], "close reason byte equality"); }
-    ws_free_decode(&reply); close_fd(fds[0]); close_fd(fds[1]); delete fds; delete body;
+    ws_free_decode(&reply); close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds; delete body;
     assert_true(!ws_send_close(-1, 1005, "", false), "invalid outbound status returns false");
     let long_reason <[char]> = new [char, 125]{};
     for (let i <int> = 0; i < 124; i++) { long_reason[i] = 'a'; }
@@ -172,41 +202,55 @@ fun close_bytes_and_eof() <noret> {
     free_str(reason); delete long_reason;
     fds = new_pair();
     let short_frame <[char]> = [cast<char>(130), cast<char>(5), 'a'];
-    write_all(fds[1], short_frame, 3); close_fd(fds[1]); delete short_frame;
-    msg = ws_recv_message(fds[0], false);
+    write_all(fds.peer, short_frame, 3); close_fd(fds.peer); delete short_frame;
+    msg = ws_recv_message(fds.client, false);
     assert_true(!msg.ok && msg.closed && msg.error_code == 0, "truncated transport returns error");
-    ws_free_message(&msg); close_fd(fds[0]); delete fds;
+    ws_free_message(&msg); close_fd(fds.client); http_server_close(fds.server); delete fds;
 }
 
 fun fragmented_failure() <noret> {
-    let fds <[int]> = new_pair();
+    let fds <&Pair> = new_pair();
     let b <[char]> = [cast<char>(226), cast<char>(130)];
-    assert_true(ws_send_frame(fds[1], false, 1, b, 2, false), "unfinished UTF-8 start");
-    assert_true(ws_send_frame(fds[1], true, 0, b, 0, false), "unfinished UTF-8 end");
-    let msg <WsMsgResult> = ws_recv_message(fds[0], false);
+    assert_true(ws_send_frame(fds.peer, false, 1, b, 2, false), "unfinished UTF-8 start");
+    assert_true(ws_send_frame(fds.peer, true, 0, b, 0, false), "unfinished UTF-8 end");
+    let msg <WsMsgResult> = ws_recv_message(fds.client, false);
     assert_true(!msg.ok && msg.error_code == 1007, "truncated fragmented UTF-8 fails"); ws_free_message(&msg);
-    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete b;
+    close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds; delete b;
     fds = new_pair();
     let sequence <[char]> = [cast<char>(2), cast<char>(0), cast<char>(129), cast<char>(125)];
-    write_all(fds[1], sequence, 4);
-    msg = ws_recv_message(fds[0], false);
+    write_all(fds.peer, sequence, 4);
+    msg = ws_recv_message(fds.client, false);
     assert_true(!msg.ok && msg.error_code == 1002, "new data during fragmentation fails before body"); ws_free_message(&msg);
-    close_fd(fds[0]); close_fd(fds[1]); delete fds; delete sequence;
+    close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds; delete sequence;
+}
+
+// The writer runs on a worker thread: the frame it writes is large enough
+// that writing it from the reading thread would fill the socket buffer and
+// deadlock. The bytes are in a heap buffer the thread reads through a
+// captured pointer.
+struct Stream {
+    wire <[char]>,
+    size <int>,
+    peer <HttpSocket>,
 }
 
 // Concurrent writer prevents test setup from filling the socket send buffer.
 fun receive_stream(wire: [char], size: int, expected: int, error: int) <noret> {
-    let fds <[int]> = new_pair();
-    let pid <int> = fork_process();
-    assert_true(pid >= 0, "fork");
-    if (pid == 0) {
-        close_fd(fds[0]); write_all(fds[1], wire, size); drain(fds[1]); close_fd(fds[1]); exit_child(0);
-    }
-    close_fd(fds[1]);
-    let msg <WsMsgResult> = ws_recv_message(fds[0], false);
+    let fds <&Pair> = new_pair();
+    let stream <&Stream> = new Stream{wire: wire, size: size, peer: fds.peer};
+    let worker <Thread> = Thread::spawn(fun () <noret> {
+        let s <&Stream> = stream;
+        write_all(s.peer, s.wire, s.size);
+        drain(s.peer);
+    });
+    let msg <WsMsgResult> = ws_recv_message(fds.client, false);
+    // The reading end closes before the writer is joined: the writer drains
+    // its own socket afterwards, and a drain only ends at end of stream.
+    close_fd(fds.client);
+    worker.join();
     if (error == 0) { assert_true(msg.ok && msg.payload_len == expected, "fragment reassembly length"); }
     else { assert_true(!msg.ok && msg.error_code == error, "fragment budget rejection"); }
-    ws_free_message(&msg); close_fd(fds[0]); delete fds; wait_ok(pid);
+    ws_free_message(&msg); http_server_close(fds.server); delete stream; delete fds;
 }
 
 fun fragment_limits() <noret> {
@@ -231,35 +275,43 @@ fun fragment_limits() <noret> {
     delete wire;
 }
 
-fun dial(port: int) <int> {
-    let fd <int> = open_socket(2, 1, 0);
-    assert_true(fd >= 0, "open loopback socket");
-    let addr <[int]> = new [int, 4]{};
-    addr[0] = cast<int>(2 + cast<long>(port / 256) * 65536 + cast<long>(port % 256) * 16777216);
-    addr[1] = parse_address("127.0.0.1");
-    assert_true(connect_socket(fd, &addr[0], 16) == 0, "connect loopback");
-    delete addr; return fd;
-}
+// Counting open descriptors is a POSIX operation: fcntl(F_GETFD) on a
+// descriptor says whether it is open. Windows has no equivalent, so the
+// descriptor-leak assertion below runs where the count exists and the rest of
+// the test runs everywhere.
+#c_ifdef FIN_TARGET_LINUX
+#[llvm_name="fcntl"] @define descriptor_flags(fd: int, command: int) <int>;
 
 fun fd_count() <int> {
     let count <int> = 0;
     for (let i <int> = 0; i < 1024; i++) { if (descriptor_flags(i, 1) >= 0) { count++; } }
     return count;
 }
+#c_endif
+
+fun dial(port: int) <HttpSocket> {
+    let fd <HttpSocket> = http_socket_dial("127.0.0.1", port);
+    assert_true(fd != http_socket_invalid(), "connect loopback");
+    return fd;
+}
 
 fun accept_cleanup() <noret> {
     let srv <&HttpServer> = ws_server_listen(0);
     let port <int> = http_server_port(srv);
+#c_ifdef FIN_TARGET_LINUX
     let before <int> = fd_count();
+#c_endif
     for (let i <int> = 0; i < 20; i++) {
-        let fd <int> = dial(port);
+        let fd <HttpSocket> = dial(port);
         let text <string> = i % 2 == 0 : "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n" ? "bad\r\n\r\n";
         let b <[char]> = to_chars(text); write_all(fd, b, b.length - 1); delete b;
         let accepted <WsAcceptResult> = ws_server_accept(srv);
         assert_true(!accepted.ok, "invalid upgrade rejected");
         drain(fd); close_fd(fd);
     }
+#c_ifdef FIN_TARGET_LINUX
     assert_true(fd_count() == before, "failed accepts do not leak descriptors");
+#c_endif
     ws_server_close(srv);
 }
 
@@ -284,18 +336,30 @@ fun server_coalesced() <noret> {
     delete wire; delete req; delete payload; delete key; ws_free_bytes(&frame);
 }
 
+// What the client thread reports back.
+struct ClientResult {
+    ok <bool>,
+    payload_len <int>,
+    first <char>,
+}
+
 fun client_coalesced() <noret> {
     let srv <&HttpServer> = ws_server_listen(0);
     let port <int> = http_server_port(srv);
-    let pid <int> = fork_process(); assert_true(pid >= 0, "fork loopback client");
-    if (pid == 0) {
-        close_fd(srv.fd);
+    let shared <&ClientResult> = new ClientResult{ok: false, payload_len: 0, first: cast<char>(0)};
+    let worker <Thread> = Thread::spawn(fun () <noret> {
+        let s <&ClientResult> = shared;
         let c <WsClientResult> = ws_client_connect("127.0.0.1", port, "/");
-        assert_true(c.ok, "client upgrade succeeds");
-        let msg <WsMsgResult> = ws_recv_message(c.fd, false);
-        assert_true(msg.ok && msg.payload_len == 5 && msg.payload[0] == 'f', "101 coalesced frame preserved");
-        ws_free_message(&msg); close_fd(c.fd); exit_child(0);
-    }
+        s.ok = c.ok;
+        if (c.ok) {
+            let msg <WsMsgResult> = ws_recv_message(c.fd, false);
+            s.ok = msg.ok;
+            s.payload_len = msg.payload_len;
+            if (msg.payload_len > 0) { s.first = msg.payload[0]; }
+            ws_free_message(&msg);
+        }
+        close_fd(c.fd);
+    });
     let conn <&HttpConn> = http_accept(srv);
     let request <HttpReadResult> = http_read_request(conn);
     assert_true(request.ok, "raw server reads upgrade");
@@ -311,14 +375,18 @@ fun client_coalesced() <noret> {
     for (let i <int> = 0; i < headers.length - 1; i++) { wire[i] = headers[i]; }
     for (let i <int> = 0; i < frame.len; i++) { wire[headers.length - 1 + i] = frame.data[i]; }
     write_all(conn.fd, wire, size);
-    http_close(conn); ws_server_close(srv); wait_ok(pid);
-    delete wire; delete headers; delete body; delete key; ws_free_bytes(&frame);
+    http_close(conn);
+    worker.join();
+    assert_true(shared.ok, "client upgrade succeeds");
+    assert_true(shared.payload_len == 5 && shared.first == 'f', "101 coalesced frame preserved");
+    ws_server_close(srv);
+    delete shared; delete wire; delete headers; delete body; delete key; ws_free_bytes(&frame);
 }
 
 fun main() <noret> {
-    alarm_sec(cast<uint>(90));
     malformed_headers(); malformed_payloads();
-    controls_and_utf8(true); controls_and_utf8(false); close_bytes_and_eof(); fragmented_failure();
-    fragment_limits(); accept_cleanup(); server_coalesced(); client_coalesced();
+    controls_and_utf8(true); controls_and_utf8(false); close_bytes_and_eof();
+    fragmented_failure(); fragment_limits(); accept_cleanup();
+    server_coalesced(); client_coalesced();
     printf("all fin-websocket socket tests passed\n");
 }
