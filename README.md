@@ -125,8 +125,9 @@ duplicate singleton rejection relies on the coordinated zhttp snapshot.
 **VERIFIED 2026-10-21** — frozen finc 0.4.0 (contract 3), Linux x86-64,
 coordinated sibling zhttp and fin-crypto sources, executable builds at **O0
 and O2**. All commands below exit zero; no Python peer or external test service
-is needed. The socket suite uses Fin libc bindings for socketpair, fork and
-loopback peers, with an alarm turning accidental blocking into a failed run.
+is needed. The socket suite uses loopback sockets from the library's own
+transport and worker threads for the concurrent cases, so it needs no
+socketpair, no fork and no external peer.
 
 From the workspace parent containing `fin-websocket`, `zhttp`, `fin-crypto`
 and `.toolchain`, run this Bash block:
