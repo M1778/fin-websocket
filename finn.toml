@@ -5,7 +5,7 @@ envpath = ".finn"
 entrypoint = "websocket.fin"
 
 [packages]
-zhttp = "M1778/zhttp@3ec72c6ddd47c41255cb2295ab107320a05708ce"
+zhttp = "M1778/zhttp@4e486903ac5c0156b0b354cc4462ca6c08ea322b"
 fin-crypto = "M1778/fin-crypto@777990f2ef19ec7be6a69a628957ffb48da11974"
 
 [scripts]
