@@ -26,7 +26,7 @@ Then `import { ... } from websocket::fin;`.
 
 ## Dependencies
 
-- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `4e486903ac5c0156b0b354cc4462ca6c08ea322b` — HTTP Upgrade parsing and the native socket transport.
+- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `5f6746da3a2294804c42534ba44a066c6b6705c8` — HTTP Upgrade parsing and the native socket transport.
 - [`M1778/fin-crypto`](https://github.com/M1778/fin-crypto), commit `777990f2ef19ec7be6a69a628957ffb48da11974` — CSPRNG and token comparison.
 - Fin std: `bits`, `strings`, `networking` (socket creation/address helpers).
 
