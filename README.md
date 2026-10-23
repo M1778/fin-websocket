@@ -26,7 +26,7 @@ Then `import { ... } from websocket::fin;`.
 
 ## Dependencies
 
-- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `3ec72c6ddd47c41255cb2295ab107320a05708ce` — HTTP Upgrade parsing and the native socket transport.
+- [`M1778/zhttp`](https://github.com/M1778/zhttp), commit `5f6746da3a2294804c42534ba44a066c6b6705c8` — HTTP Upgrade parsing and the native socket transport.
 - [`M1778/fin-crypto`](https://github.com/M1778/fin-crypto), commit `777990f2ef19ec7be6a69a628957ffb48da11974` — CSPRNG and token comparison.
 - Fin std: `bits`, `strings`, `networking` (socket creation/address helpers).
 
@@ -122,12 +122,14 @@ duplicate singleton rejection relies on the coordinated zhttp snapshot.
 
 ## Verification status
 
-**VERIFIED 2026-10-21** — frozen finc 0.4.0 (contract 3), Linux x86-64,
-coordinated sibling zhttp and fin-crypto sources, executable builds at **O0
-and O2**. All commands below exit zero; no Python peer or external test service
-is needed. The socket suite uses loopback sockets from the library's own
-transport and worker threads for the concurrent cases, so it needs no
-socketpair, no fork and no external peer.
+**Native O0/O2 verification:** handshake/frame and loopback socket suites passed
+on Linux, macOS and Windows, each on x86-64 and ARM64, in
+[ecosystem run 40034937084](https://github.com/M1778/fin-sdk/actions/runs/40034937084),
+at WebSocket revision `b3648bb633f04c48de98c06a19143d2169276be6` with the exact
+zhttp and crypto pins recorded there. The compiler was externally verified
+candidate `5360b051b8e82a4f10052c3dbb77bc66cc727cd7` from CI run `40028977601`,
+not a released compiler. The socket suite uses library loopback transport and
+worker threads, without socketpair, fork or an external peer.
 
 From the workspace parent containing `fin-websocket`, `zhttp`, `fin-crypto`
 and `.toolchain`, run this Bash block:

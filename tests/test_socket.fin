@@ -194,11 +194,11 @@ fun close_bytes_and_eof() <noret> {
     assert_true(reply.ok && reply.payload_len == 5, "close reason not truncated");
     for (let i <int> = 0; i < 5; i++) { assert_true(reply.payload[i] == body[i], "close reason byte equality"); }
     ws_free_decode(&reply); close_fd(fds.client); close_fd(fds.peer); http_server_close(fds.server); delete fds; delete body;
-    assert_true(!ws_send_close(-1, 1005, "", false), "invalid outbound status returns false");
+    assert_true(!ws_send_close(http_socket_invalid(), 1005, "", false), "invalid outbound status returns false");
     let long_reason <[char]> = new [char, 125]{};
     for (let i <int> = 0; i < 124; i++) { long_reason[i] = 'a'; }
     let reason <string> = from_chars(long_reason, 0, 124);
-    assert_true(!ws_send_close(-1, 1000, reason, false), "long outbound reason returns false");
+    assert_true(!ws_send_close(http_socket_invalid(), 1000, reason, false), "long outbound reason returns false");
     free_str(reason); delete long_reason;
     fds = new_pair();
     let short_frame <[char]> = [cast<char>(130), cast<char>(5), 'a'];
@@ -318,7 +318,7 @@ fun accept_cleanup() <noret> {
 fun server_coalesced() <noret> {
     let srv <&HttpServer> = ws_server_listen(0);
     let port <int> = http_server_port(srv);
-    let fd <int> = dial(port);
+    let fd <HttpSocket> = dial(port);
     let request <string> = ws_client_request("127.0.0.1", port, "/", "dGhlIHNhbXBsZSBub25jZQ==");
     let req <[char]> = to_chars(request); free_str(request);
     let payload <[char]> = to_chars("first"); let key <[char]> = new [char, 4]{};
